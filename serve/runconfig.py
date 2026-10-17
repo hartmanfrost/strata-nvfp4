@@ -72,6 +72,12 @@ EDITABLE = [
     ("conversation_disk_persist", ("arg", "--conversation-disk-persist", "flag"),
      "Keep the dialogs on the disk for the next start (off: removed when the model stops, and after 30 minutes). "
      "Saved after 60 s without requests, so closing Strata's window loses at most what came after"),
+    ("conversation_disk_chunked", ("arg", "--conversation-disk-chunked", "flag"),
+     "Write the disk's dialogs as a small manifest plus deduplicated chunks: a dialog that goes on writes only what "
+     "changed (the shared prefix and the old checkpoints are stored once). Off: one file per dialog, as before. Both "
+     "kinds are read either way"),
+    ("conversation_disk_chunk_tokens", ("arg", "--conversation-disk-chunk-tokens"),
+     "Tokens of K/V per chunk of the chunked format (a multiple of 4, 64 to 4096; engine default 512)"),
     # the context, and past the trained one the RoPE extension setup writes there (setup.py resolve_rope)
     ("max_context", ("arg", "--max-context", "context"),
      "Context size in tokens: the longest dialog. More takes more VRAM for its K/V, taken from the expert cache "
@@ -89,11 +95,12 @@ SECTIONS = {"sampling.temperature": "Sampling defaults", "reasoning_budget_token
 # what an empty field means, where "default" says too little (the page's placeholder / first choice)
 DEFAULTS = {"conversation_cache_slots": "default: 4", "conversation_cache_mib": "off", "conversation_disk_dir": "off",
             "conversation_disk_mib": "default: 32768", "conversation_disk_persist": "default: off",
+            "conversation_disk_chunked": "default: off", "conversation_disk_chunk_tokens": "default: 512",
             "update_check": "default: on"}
 TRAINED_CTX = 262144      # the model's trained context (Qwen3.8-Flash-Next: every family setup installs)
 CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]   # setup.py's CONTEXTS
 DIALOG_KEYS = ("conversation_cache_slots", "conversation_cache_mib", "conversation_disk_dir", "conversation_disk_mib",
-               "conversation_disk_persist")
+               "conversation_disk_persist", "conversation_disk_chunked", "conversation_disk_chunk_tokens")
 NO_PROJECTION = ("this model loads no refusal projection (--control-vector-scaled): setup loads it for the original "
                  "Qwen's families only, never for NVIDIA's model (its license does not allow bypassing the model's "
                  "safety guardrails), nor for Swift 1.5 or the Coder")
@@ -402,9 +409,13 @@ def _check_dialogs(cfg: dict):
                 raise ValueError(f"{k}: dialogs are kept only with RAM for them - set conversation_cache_mib too "
                                  "(e.g. 16384), or clear both")
     if not v["conversation_disk_dir"]:
-        for k in ("conversation_disk_mib", "conversation_disk_persist"):
+        for k in ("conversation_disk_mib", "conversation_disk_persist", "conversation_disk_chunked",
+                  "conversation_disk_chunk_tokens"):
             if v[k] is not None:
                 raise ValueError(f"{k}: set the folder (conversation_disk_dir) too, or clear both")
+    t = v["conversation_disk_chunk_tokens"]
+    if t is not None and (not isinstance(t, int) or t < 64 or t > 4096 or t % 4):
+        raise ValueError("conversation_disk_chunk_tokens: a multiple of 4 between 64 and 4096")
 
 
 def save(path: str | Path, cfg: dict) -> Path:

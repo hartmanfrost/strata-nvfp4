@@ -1146,6 +1146,10 @@ struct Options {
     /// for what the others wrote first, so a conversation parked by one replica comes back on any.  Implies
     /// --conversation-disk-persist (the files are bound to the model and settings, not to this process).
     bool conversation_disk_shared = false;
+    /// --conversation-disk-chunked (strata-nvfp4): the disk tier writes the chunked, deduplicated format v2
+    /// (conversation_chunks.hpp; docs/NVFP4.md "Chunked parked dialogs").  Reading takes either format.
+    bool conversation_disk_chunked = false;
+    int64_t conversation_disk_chunk_tokens = 512;   ///< --conversation-disk-chunk-tokens: tokens of K/V per chunk
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1352,6 +1356,11 @@ void usage() {
                  "                       of a server, one per GPU): every park goes there and each request looks for what\n"
                  "                       the others wrote, so a parked conversation resumes on any replica (implies\n"
                  "                       --conversation-disk-persist)\n"
+                 "  --conversation-disk-chunked  --serve: write the disk tier's conversations as a small manifest plus\n"
+                 "                       deduplicated chunks (a continued conversation writes only what changed; an\n"
+                 "                       unreferenced chunk is deleted after 10 min; default off = one file each)\n"
+                 "  --conversation-disk-chunk-tokens N  --serve, with --conversation-disk-chunked: tokens of K/V per\n"
+                 "                       chunk (a multiple of 4, 64..4096; default 512)\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
@@ -4043,6 +4052,18 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-disk-dir") o.conversation_disk_dir = next("--conversation-disk-dir");
         else if (a == "--conversation-disk-persist") o.conversation_disk_persist = true;
         else if (a == "--conversation-disk-shared") o.conversation_disk_shared = o.conversation_disk_persist = true;
+        else if (a == "--conversation-disk-chunked") o.conversation_disk_chunked = true;
+        else if (a == "--conversation-disk-chunk-tokens") {
+            const std::string value = next("--conversation-disk-chunk-tokens");
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 64 || number > 4096 ||
+                number % 4) {
+                std::fprintf(stderr, "--conversation-disk-chunk-tokens needs a multiple of 4 between 64 and 4096\n");
+                return 2;
+            }
+            o.conversation_disk_chunk_tokens = number;
+        }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -14124,6 +14145,8 @@ int main(int argc, char** argv) {
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
         disk_opts.ttl_s = o.conversation_disk_ttl_min * 60;
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+        disk_opts.chunked = o.conversation_disk_chunked;
+        disk_opts.chunk_tokens = (uint32_t) o.conversation_disk_chunk_tokens;
         if (o.conversation_disk_persist && !disk_opts.dir.empty()) {
             // the session files' identity: a later start with the same model and settings takes the files in
             std::string id_err;

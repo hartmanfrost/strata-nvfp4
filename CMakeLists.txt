@@ -246,7 +246,7 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
   # the disk tier of the parked conversations (conversation_disk.hpp): write, match, read back, budget, time limit
   add_executable(conversation_disk_test src/core/conversation_disk_test.cpp src/core/conversation_disk.cpp
-                 src/core/conversation_file.cpp)
+                 src/core/conversation_file.cpp src/core/conversation_chunks.cpp src/core/conversation_codec.cpp)
   target_include_directories(conversation_disk_test PRIVATE include)
   find_package(Threads REQUIRED)   # the tier's background writer
   target_link_libraries(conversation_disk_test PRIVATE Threads::Threads)

@@ -854,6 +854,13 @@ void ChunkPool::remove_all() {
 #endif
 
 uint64_t ChunkPool::bytes() const { std::lock_guard<std::mutex> g(p_->mu); return p_->bytes; }
+uint64_t ChunkPool::live_bytes() const {
+    std::lock_guard<std::mutex> g(p_->mu);
+    uint64_t n = 0;
+    for (const auto& kv : p_->idx)
+        if (kv.second.refs > 0) n += kv.second.file_bytes;
+    return n;
+}
 size_t ChunkPool::count() const { std::lock_guard<std::mutex> g(p_->mu); return p_->idx.size(); }
 uint32_t ChunkPool::refs_of(const ChunkKey& k) const {
     std::lock_guard<std::mutex> g(p_->mu);
@@ -1418,6 +1425,10 @@ bool write_impl(ChunkPool& pool, const std::string& path, const SavedConversatio
         if (opt.phase) opt.phase("flush", stats.new_file_bytes);
         std::string why;
         if (!pool.sync_touched_shards(why)) { st.error = SessionError::io; error = "chunked session: " + why; return false; }
+    }
+    if (opt.before_publish) {   // shared folders: the chunks hit may have been swept since they were looked at
+        std::string why;
+        if (!opt.before_publish(refs, why)) { st.error = SessionError::io; error = "chunked session: " + why; return false; }
     }
     if (opt.phase) opt.phase("publish", file.size());
     std::string why;

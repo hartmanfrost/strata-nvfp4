@@ -16,6 +16,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_chunks.hpp"
 #include "strata/core/conversation_file.hpp"
 
 #include <chrono>
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -44,10 +46,21 @@ struct ConversationDiskOptions {
     /// rescan() takes in what the others wrote, and open() leaves alone the files of other identities and the young
     /// leftovers another engine may still be writing.  Needs `persist` (the files are bound to the identity).
     bool shared = false;
+    /// (strata-nvfp4) the chunked, deduplicated format v2 (conversation_chunks.hpp): a manifest per stage plus
+    /// content-addressed chunks in <dir>/strata-pool-<identity>/ (non-persist: strata-pool-n<nonce>).  The reader takes
+    /// v1 and v2 files alike whatever this says; it picks what is WRITTEN.  Falls back to v1 on Windows.
+    bool chunked = false;
+    uint32_t chunk_tokens = 512;     ///< chunked: tokens of K/V per slab (a multiple of 4, 64..4096)
+    ChunkCodec codec = ChunkCodec::raw;   ///< chunked: how chunks are stored (zstd falls back to raw when not built in)
+    int io_workers = 2;              ///< chunked: threads of the chunk pipeline
+    /// chunked, tests: seconds since the epoch for the chunks' grace periods (default: the system clock)
+    std::function<int64_t()> wall_clock_s;
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
     /// Tests: called on the writer thread before each write starts.
     std::function<void()> before_write;
+    /// Tests (chunked): called on the writing thread after a manifest's chunks are written or hit, before it is published.
+    std::function<void()> before_manifest;
 };
 
 /// What the tier did since it started (diagnostics).
@@ -58,6 +71,11 @@ struct ConversationDiskStats {
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
     double write_ms = 0, read_ms = 0, wait_ms = 0;
+    // chunked (format v2): chunks looked up by the writes, and what they cost
+    uint64_t chunks_hit = 0, chunks_new = 0;
+    uint64_t raw_bytes = 0, dedup_bytes = 0, new_file_bytes = 0;   ///< K/V + state bytes seen; of them already stored; new chunk file bytes
+    uint64_t chunks_swept = 0, swept_bytes = 0;                    ///< unreferenced chunks deleted
+    bool direct_io = false;                                        ///< the last chunk write used O_DIRECT
 };
 
 class ConversationDiskTier {
@@ -147,7 +165,8 @@ public:
     size_t expire();
 
     size_t size() const;                    ///< entries on the disk
-    uint64_t bytes() const;                 ///< their files' bytes
+    uint64_t bytes() const;                 ///< their files' bytes (chunked: manifests + the chunk pool, unreferenced chunks included)
+    size_t pool_chunks() const;             ///< chunked: chunk files the pool knows (tests); 0 otherwise
     ConversationDiskStats stats() const;
     /// One line of totals for the log.
     std::string summary() const;
@@ -163,6 +182,11 @@ private:
         bool cvec = true;
         uint64_t bytes = 0;                      ///< the files' bytes (queued: the image's estimate)
         Clock::time_point at;
+        bool chunked = false;                    ///< format v2: `files` are manifests, `refs` the chunks they name
+        std::vector<ChunkRef> refs;              ///< every chunk of every manifest, duplicates included (each ref()'d once)
+        uint64_t manifest_bytes = 0;
+        uint64_t written_bytes = 0;              ///< bytes this write put on the disk (chunked: new chunks + manifests)
+        std::string chunk_note;                  ///< the write's chunk counters, for its log line
         std::string index;                       ///< persist: the index file
         int64_t written_s = 0;                   ///< persist: when it was written (seconds since the epoch)
     };
@@ -186,6 +210,22 @@ private:
     bool write_index(Entry& e, std::string& error) const;
     bool read_index(const std::string& path, Entry& e) const;
     std::string scan_folder(size_t& stale, std::error_code& ec);   // open(): take in or remove; its log part
+    // chunked (format v2); all with m_ held unless noted
+    bool bind_chunks(Entry& e) const;                // a scanned entry's manifests: refs taken, chunks checked; false = refuse it
+    void release_refs(Entry& e) const;               // unref + forget
+    uint64_t pool_bytes_all() const;                 // pool.bytes() or 0
+    void make_room_locked(uint64_t protect_a, uint64_t protect_b, size_t& evicted);   // the budget loop
+    size_t sweep_locked(bool force);                 // unreferenced chunks, not shared (open()): rate limited (once a minute)
+    // Unreferenced chunks, rate limited; WITHOUT m_ (called with it released: the folder listing, the manifest parsing
+    // of a shared sweep and the unlinks do not hold up best() / take() / put()).  `freed`: the bytes it removed.
+    size_t sweep_pool(bool force, uint64_t* freed = nullptr);
+    // shared: every chunk any manifest of this identity names; `held`: this engine's entries (index path -> their chunks)
+    std::set<ChunkKey> foreign_refs(const std::vector<std::pair<std::string, std::vector<ChunkKey>>>& held) const;
+    void remove_foreign_pools() const;               // open(): other runs' (non-persist) or identities' pools
+    std::string pool_dir() const;
+    std::unique_ptr<ChunkPool> pool_;
+    bool swept_ = false;
+    Clock::time_point last_sweep_{};
     std::set<std::string> seen_index_;   ///< shared: index files looked at already (taken in, or another identity's)
 
     ConversationDiskOptions options_;

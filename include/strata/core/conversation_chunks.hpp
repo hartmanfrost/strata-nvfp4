@@ -124,6 +124,7 @@ public:
     // durable writes: fsync the shard folders touched since the last call
     bool sync_touched_shards(std::string& error);
     uint64_t bytes() const;                                 // file bytes of every known chunk, ghosts included
+    uint64_t live_bytes() const;                            // the same for the referenced or pinned chunks only
     uint32_t refs_of(const ChunkKey&) const;                // tests and diagnostics (0 for an unknown chunk)
     size_t count() const;
     void remove_all();                                      // the whole folder: non-persist end, clear()
@@ -142,6 +143,9 @@ struct ChunkedWriteOptions {
     std::function<bool()> cancel;       // asked before every chunk: true gives the write up (error "cancelled")
     SessionProgress progress;           // (raw bytes done, raw bytes of the image) after every chunk
     SessionPhase phase;                 // "flush" and "publish" before each starts
+    // asked after the last chunk and before the manifest is published (false + why: the write is given up); the
+    // shared tier re-checks there that every chunk it hit is still on the disk
+    std::function<bool(const std::vector<ChunkRef>&, std::string& why)> before_publish;
     std::function<int(const char* step)> fault;   // the manifest's steps as SessionWriteOptions::fault: "write", "file_flush", "rename", "dir_flush"
 };
 struct ChunkedWriteStats {

@@ -187,8 +187,10 @@ bool session_file_write(const std::string& path, const SavedConversation& meta, 
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
 
-// The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
-// rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.
+// The checkpoints worth a write into a SESSION file (/slots save, QUIT): the deepest one (the next turn's resume point
+// when the live tail was rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this
+// geometry.  The disk tier's chunked format (conversation_chunks.hpp) is not bound by this: it keeps the whole chain, as
+// an old checkpoint's chunks are shared with the previous write and cost nothing new.
 std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vector<ConversationCheckpoint>& chain);
 // The same choice without a copy (nullptr for an empty chain).
 const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<ConversationCheckpoint>& chain);

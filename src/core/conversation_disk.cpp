@@ -14,6 +14,7 @@
 #include <random>
 #include <set>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #if defined(__linux__)
 #include <sys/resource.h>
@@ -139,12 +140,21 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
 #endif
 std::string fmt(const char* f, ...) {
-    char buf[512];
+    char buf[1024];
     va_list ap;
     va_start(ap, f);
     std::vsnprintf(buf, sizeof buf, f, ap);
     va_end(ap);
     return buf;
+}
+
+// the refs of one entry, each key once (a stat per chunk, not per mention)
+std::vector<ChunkRef> unique_refs(const std::vector<ChunkRef>& refs) {
+    std::set<ChunkKey> seen;
+    std::vector<ChunkRef> out;
+    for (const auto& r : refs)
+        if (seen.insert(r.key).second) out.push_back(r);
+    return out;
 }
 
 uint64_t sources_bytes(const std::vector<SessionKvSource>* sources) {
@@ -177,16 +187,84 @@ ConversationDiskTier::~ConversationDiskTier() {
     std::lock_guard<std::mutex> lock(m_);
     if (!open_) return;
     if (options_.persist) {
-        log(fmt("end: %zu conversations kept on the disk for the next start (%.0f MiB)", entries_.size(), mib(bytes_)));
+        log(fmt("end: %zu conversations kept on the disk for the next start (%.0f MiB)", entries_.size(),
+                mib(bytes_ + pool_bytes_all())));
         return;
     }
     if (dropped || !entries_.empty())
         log(fmt("end: %zu queued dropped, %zu conversations removed from the disk", dropped, entries_.size()));
     while (!entries_.empty()) remove_locked(0, true);
+    if (pool_) pool_->remove_all();   // not persistent: the chunks go with the tier
 }
 
 SessionFileIdentity ConversationDiskTier::file_identity() const {
     return options_.persist ? options_.identity : SessionFileIdentity{nonce_, kTierConfig};
+}
+
+std::string ConversationDiskTier::pool_dir() const {
+    char name[64];
+    if (options_.persist) {
+        const uint64_t id[2] = {options_.identity.model, options_.identity.config};
+        std::snprintf(name, sizeof name, "strata-pool-%016llx", (unsigned long long) session_hash64(id, sizeof id, 0));
+    } else {
+        std::snprintf(name, sizeof name, "strata-pool-n%016llx", (unsigned long long) nonce_);
+    }
+    return ustr(upath(options_.dir) / name);
+}
+
+void ConversationDiskTier::remove_foreign_pools() const {
+    if (options_.shared) return;   // other engines' pools are theirs
+    std::error_code ec;
+    const std::string ours = ustr(upath(pool_dir()).filename());
+    for (fs::directory_iterator it(upath(options_.dir), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = ustr(it->path().filename());
+        if (name.rfind("strata-pool-", 0) != 0 || name == ours) continue;
+        std::error_code dec;
+        if (!it->is_directory(dec) || it->is_symlink(dec)) continue;
+        // not persistent: the leftovers of earlier runs (random names); persistent: the other identities' pools
+        if (options_.persist || name.rfind("strata-pool-n", 0) == 0) fs::remove_all(it->path(), dec);
+    }
+}
+
+uint64_t ConversationDiskTier::pool_bytes_all() const { return pool_ ? pool_->bytes() : 0; }
+
+size_t ConversationDiskTier::pool_chunks() const {
+    std::lock_guard<std::mutex> lock(m_);
+    return pool_ ? pool_->count() : 0;
+}
+
+void ConversationDiskTier::release_refs(Entry& e) const {
+    if (pool_ && !e.refs.empty()) pool_->unref(e.refs.data(), e.refs.size());
+    e.refs.clear();
+}
+
+// The manifests of a scanned entry: parsed for their chunk references, every chunk checked on the disk (a missing one
+// refuses the entry - a power loss tore it, or another engine swept it), then the references are taken.  A v1 entry
+// passes untouched.
+bool ConversationDiskTier::bind_chunks(Entry& e) const {
+    size_t chunked = 0;
+    for (const auto& f : e.files) chunked += is_chunked_manifest(f) ? 1 : 0;
+    if (chunked == 0) return true;
+    if (chunked != e.files.size() || !pool_) return false;
+    const SessionFileIdentity fid = file_identity();
+    std::vector<ChunkRef> refs;
+    uint64_t mbytes = 0;
+    for (const auto& f : e.files) {
+        std::vector<ChunkRef> r;
+        uint64_t mb = 0;
+        std::string why;
+        if (!chunked_manifest_refs(f, fid, r, mb, why)) return false;
+        refs.insert(refs.end(), r.begin(), r.end());
+        mbytes += mb;
+    }
+    for (const auto& r : unique_refs(refs))
+        if (!pool_->exists(r)) return false;
+    pool_->ref(refs.data(), refs.size());
+    e.refs = std::move(refs);
+    e.chunked = true;
+    e.manifest_bytes = mbytes;
+    e.bytes = mbytes;
+    return true;
 }
 
 bool ConversationDiskTier::write_index(Entry& e, std::string& error) const {
@@ -277,7 +355,7 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
         if (!it->is_regular_file(ec) || !tier_file(ustr(it->path().filename()))) continue;
         Entry e;
         const bool index = it->path().extension() == ".idx";
-        const bool taken = index && options_.persist && read_index(ustr(it->path()), e);
+        const bool taken = index && options_.persist && read_index(ustr(it->path()), e) && bind_chunks(e);
         if (index && options_.shared) seen_index_.insert(ustr(it->path()));
         if (taken) found.push_back(std::move(e));
         else others.push_back(ustr(it->path()));
@@ -316,13 +394,13 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
         entries_.push_back(std::move(e));
     }
     size_t over = 0;
-    while (!entries_.empty() && bytes_ > options_.budget_bytes) {
-        remove_locked(0, true);
-        ++over;
-    }
+    make_room_locked(0, 0, over);
+    // chunks no manifest names (an interrupted write, a removed entry): kept for the grace, then swept
+    if (pool_ && !options_.shared) sweep_locked(true);
     if (!options_.persist) return {};
     return fmt("persistent (budget only): %zu conversations from earlier runs (%.0f MiB), %zu refused (another model, "
-               "engine version or settings), %zu over the budget removed", entries_.size(), mib(bytes_), refused, over);
+               "engine version or settings), %zu over the budget removed", entries_.size(),
+               mib(bytes_ + pool_bytes_all()), refused, over);
 }
 
 void ConversationDiskTier::log(const std::string& line) const {
@@ -344,6 +422,25 @@ bool ConversationDiskTier::open(std::string& error) {
     fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);   // the files hold conversations
     ec.clear();
 #endif
+    pool_.reset();
+    remove_foreign_pools();
+#ifndef _WIN32
+    const std::string pdir = pool_dir();
+    std::error_code pec;
+    if (options_.chunked || (options_.persist && fs::is_directory(upath(pdir), pec))) {
+        // (a persistent folder an earlier chunked run left is read and swept even when this run writes v1)
+        ChunkPoolOptions po;
+        po.dir = pdir;
+        po.codec = options_.codec;
+        po.min_free_bytes = options_.min_free_bytes;
+        po.clock_s = options_.wall_clock_s;
+        auto pool = std::make_unique<ChunkPool>(std::move(po));
+        if (!pool->open(error)) return false;
+        pool_ = std::move(pool);
+    }
+#else
+    if (options_.chunked) log("chunked format: POSIX only, writing the one-file format");
+#endif
     size_t stale = 0;
     std::string taken_in;
     {
@@ -357,8 +454,10 @@ bool ConversationDiskTier::open(std::string& error) {
     open_ = true;
     thread_ = std::thread([this] { writer(); });
     const std::string kept = options_.persist ? taken_in : fmt("%lld min per conversation", (long long) (options_.ttl_s / 60));
-    log(fmt("on: %s, budget %.0f MiB, %s; %zu stale files removed", options_.dir.c_str(), mib(options_.budget_bytes),
-            kept.c_str(), stale));
+    log(fmt("on: %s, budget %.0f MiB, %s; %zu stale files removed%s", options_.dir.c_str(), mib(options_.budget_bytes),
+            kept.c_str(), stale,
+            options_.chunked && pool_ ? fmt("; chunked format v2, %u tokens a slab, pool %s", options_.chunk_tokens,
+                                            pool_dir().c_str()).c_str() : ""));
     return true;
 }
 
@@ -367,6 +466,7 @@ void ConversationDiskTier::remove_locked(size_t index, bool delete_files) {
     if (!e.index.empty()) remove_file(e.index);   // first, always: an entry gone from the list is not taken in again
     if (delete_files)
         for (const auto& f : e.files) remove_file(f);
+    release_refs(e);   // the chunks become ghosts (deleted after their grace, or at once under budget pressure)
     bytes_ -= e.bytes;
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
 }
@@ -392,13 +492,16 @@ size_t ConversationDiskTier::expire_locked() {
 }
 
 size_t ConversationDiskTier::expire() {
-    size_t n = 0;
+    size_t n = 0, swept = 0;
+    uint64_t freed = 0;
     {
         std::lock_guard<std::mutex> lock(m_);
         n = expire_locked();
     }
+    swept = sweep_pool(false, &freed);
     if (n) log(fmt("removed %zu conversation%s older than %lld min", n, n == 1 ? "" : "s",
                    (long long) (options_.ttl_s / 60)));
+    if (swept) log(fmt("swept %zu unreferenced chunk%s (%.0f MiB)", swept, swept == 1 ? "" : "s", mib((uint64_t) freed)));
     return n;
 }
 
@@ -482,12 +585,52 @@ bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
     wo.durable = flush;
     wo.cancel = cancel;
     e.bytes = 0;
+    const bool use_chunks = options_.chunked && pool_;
+    ChunkedWriteStats totals;
+    bool storage_failed = false;   // the disk is full (or its reserve is): the chunks this write made are ghosts to free now
     auto write_one = [&](const SavedConversation& part, const std::vector<SessionKvSource>* src, size_t k) -> bool {
         char name[96];
         std::snprintf(name, sizeof name, "%s%016llx-%llu-%zu.bin", file_prefix(), (unsigned long long) nonce_,
                       (unsigned long long) e.id, k);
         const std::string path = ustr(upath(options_.dir) / name);
         size_t written = 0;
+        if (use_chunks) {
+            // one manifest per stage, the chunks in the one pool; the manifest is the entry's file
+            ChunkedWriteOptions co;
+            co.chunk_tokens = options_.chunk_tokens;
+            co.durable = flush;
+            co.min_free_bytes = options_.min_free_bytes;
+            co.workers = options_.io_workers;
+            co.cancel = cancel;
+            if (options_.shared)   // another engine's sweep may have taken a chunk this write hit: look again
+                co.before_publish = [this](const std::vector<ChunkRef>& refs, std::string& why) {
+                    if (options_.before_manifest) options_.before_manifest();
+                    if (!options_.shared) return true;
+                    for (const auto& r : unique_refs(refs))
+                        if (!pool_->exists(r)) { why = "chunk " + r.key.hex() + " vanished before the manifest"; return false; }
+                    return true;
+                };
+            std::vector<ChunkRef> refs;
+            ChunkedWriteStats ws;
+            SessionStatus cst;
+            if (!chunked_write(*pool_, path, part, src, id, co, refs, ws, error, &cst)) {
+                storage_failed = storage_failed || cst.error == SessionError::storage;
+                remove_file(path);   // (a manifest published before a failed folder flush too)
+                return false;
+            }
+            e.files.push_back(path);
+            e.refs.insert(e.refs.end(), refs.begin(), refs.end());
+            e.bytes += ws.manifest_bytes;
+            e.manifest_bytes += ws.manifest_bytes;
+            e.chunked = true;
+            totals.raw_bytes += ws.raw_bytes;
+            totals.hit_raw_bytes += ws.hit_raw_bytes;
+            totals.new_file_bytes += ws.new_file_bytes;
+            totals.hits += ws.hits;
+            totals.misses += ws.misses;
+            totals.direct_io = totals.direct_io || ws.direct_io;
+            return true;
+        }
         // one file per stage: session_file_write writes an image's own state and K/V, never its stage_images
         const bool ok = src ? session_file_write(path, part, *src, id, written, error, wo)
                             : session_file_write(path, part, id, written, error, wo);
@@ -514,8 +657,33 @@ bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
     if (!ok) {
         for (const auto& f : e.files) remove_file(f);
         e.files.clear();
+        release_refs(e);   // the chunks only this write made stay as ghosts
+        e.bytes = e.manifest_bytes = 0;
+        if (storage_failed && pool_ && !options_.shared) {
+            // on a nearly full disk a failed multi-GB write pins its ghosts for the whole grace, and the free-space
+            // preflight then refuses every retry: free them now (never a referenced or pinned chunk)
+            size_t freed = 0;
+            const size_t n = pool_->sweep(false, true, nullptr, &freed);
+            std::lock_guard<std::mutex> lock(m_);
+            stats_.chunks_swept += n;
+            stats_.swept_bytes += freed;
+        }
+        return false;
     }
-    return ok;
+    if (use_chunks) {
+        std::lock_guard<std::mutex> lock(m_);
+        stats_.chunks_hit += totals.hits;
+        stats_.chunks_new += totals.misses;
+        stats_.raw_bytes += totals.raw_bytes;
+        stats_.dedup_bytes += totals.hit_raw_bytes;
+        stats_.new_file_bytes += totals.new_file_bytes;
+        stats_.direct_io = totals.direct_io;
+        e.written_bytes = totals.new_file_bytes + e.manifest_bytes;
+        e.chunk_note = fmt("; chunks %u new, %u hit, %.0f MiB raw, %.0f MiB deduplicated, %.0f MiB new, %s I/O",
+                           totals.misses, totals.hits, mib(totals.raw_bytes), mib(totals.hit_raw_bytes),
+                           mib(totals.new_file_bytes), totals.direct_io ? "direct" : "buffered");
+    }
+    return true;
 }
 
 namespace {
@@ -576,17 +744,115 @@ std::string ConversationDiskTier::publish_locked(Entry&& e, size_t& made_room, s
         ++i;
     }
     // the budget: the oldest go (not the new one, not one being read)
-    while (bytes_ > options_.budget_bytes) {
-        size_t victim = 0;
-        while (victim < entries_.size() && (entries_[victim].id == id || entries_[victim].id == reading_)) ++victim;
-        if (victim == entries_.size()) break;
-        remove_locked(victim, true);
-        ++made_room;
-    }
+    make_room_locked(id, 0, made_room);
     stats_.evicted += made_room;
     stats_.superseded += dropped;
-    return fmt("on disk %zu, %.0f MiB; %zu removed for the budget, %zu superseded", entries_.size(), mib(bytes_),
-               made_room, dropped);
+    return fmt("on disk %zu, %.0f MiB; %zu removed for the budget, %zu superseded", entries_.size(),
+               mib(bytes_ + pool_bytes_all()), made_room, dropped);
+}
+
+// The budget loop: the files' bytes (v1) + the manifests + the chunk pool, ghosts included.  Under pressure the
+// ghosts go first, at once (never a referenced or pinned chunk), then the oldest entry; an entry that shares all its
+// chunks frees about nothing and the loop goes on - the last entry owns whatever is left.  Shared folders: a ghost
+// there may be wanted by another engine, so only the referenced bytes count and ghosts wait out their grace.
+void ConversationDiskTier::make_room_locked(uint64_t protect_a, uint64_t protect_b, size_t& evicted) {
+    evicted = 0;
+    auto total = [&]() { return bytes_ + (pool_ ? pool_->live_bytes() : 0); };
+    for (;;) {
+        if (pool_ && !options_.shared && bytes_ + pool_->bytes() > options_.budget_bytes) {
+            size_t freed = 0;
+            const size_t n = pool_->sweep(false, true, nullptr, &freed);
+            stats_.chunks_swept += n;
+            stats_.swept_bytes += freed;
+        }
+        if (total() <= options_.budget_bytes) break;
+        size_t victim = 0;
+        while (victim < entries_.size() && (entries_[victim].id == protect_a || entries_[victim].id == protect_b ||
+                                            entries_[victim].id == reading_)) ++victim;
+        if (victim == entries_.size()) break;
+        remove_locked(victim, true);
+        ++evicted;
+    }
+}
+
+size_t ConversationDiskTier::sweep_locked(bool force) {
+    if (!pool_ || options_.shared) return 0;
+    const auto now = now_();
+    if (!force && swept_ && now - last_sweep_ < std::chrono::seconds(60)) return 0;
+    swept_ = true;
+    last_sweep_ = now;
+    size_t freed = 0;
+    const size_t n = pool_->sweep(false, false, nullptr, &freed);
+    stats_.chunks_swept += n;
+    stats_.swept_bytes += freed;
+    return n;
+}
+
+size_t ConversationDiskTier::sweep_pool(bool force, uint64_t* freed_out) {
+    if (freed_out) *freed_out = 0;
+    if (!pool_) return 0;
+    std::vector<std::pair<std::string, std::vector<ChunkKey>>> held;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        const auto now = now_();
+        if (!force && swept_ && now - last_sweep_ < std::chrono::seconds(60)) return 0;
+        swept_ = true;
+        last_sweep_ = now;
+        if (options_.shared)
+            for (const auto& e : entries_)
+                if (!e.index.empty()) {
+                    held.emplace_back(e.index, std::vector<ChunkKey>());
+                    for (const auto& r : e.refs) held.back().second.push_back(r.key);
+                }
+    }
+    // Outside m_.  A chunk an entry published after the snapshot names is referenced in the pool already (the sweep
+    // never takes a referenced chunk), and one an entry dropped meanwhile is only kept a little longer.
+    size_t freed = 0, n = 0;
+    if (options_.shared) {
+        const std::set<ChunkKey> foreign = foreign_refs(held);
+        n = pool_->sweep(true, false, &foreign, &freed);
+    } else {
+        n = pool_->sweep(false, false, nullptr, &freed);
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        stats_.chunks_swept += n;
+        stats_.swept_bytes += freed;
+    }
+    if (freed_out) *freed_out = freed;
+    return n;
+}
+
+// Shared: every chunk any manifest of this identity in the folder names - listed afresh, the entries this engine
+// holds from their references, the others' parsed from their manifests.
+std::set<ChunkKey> ConversationDiskTier::foreign_refs(
+        const std::vector<std::pair<std::string, std::vector<ChunkKey>>>& held) const {
+    std::set<ChunkKey> keys;
+    std::error_code ec;
+    const SessionFileIdentity fid = file_identity();
+    for (fs::directory_iterator it(upath(options_.dir), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = ustr(it->path().filename());
+        if (it->path().extension() != ".idx" || name.rfind(file_prefix(), 0) != 0) continue;
+        const std::string path = ustr(it->path());
+        bool known = false;
+        for (const auto& h : held)
+            if (h.first == path) {
+                keys.insert(h.second.begin(), h.second.end());
+                known = true;
+                break;
+            }
+        if (known) continue;
+        Entry t;
+        if (!read_index(path, t)) continue;   // another identity's (its own pool) or torn
+        for (const auto& f : t.files) {
+            std::vector<ChunkRef> r;
+            uint64_t mb = 0;
+            std::string why;
+            if (is_chunked_manifest(f) && chunked_manifest_refs(f, fid, r, mb, why))
+                for (const auto& x : r) keys.insert(x.key);
+        }
+    }
+    return keys;
 }
 
 void ConversationDiskTier::write(Job& job) {
@@ -597,6 +863,7 @@ void ConversationDiskTier::write(Job& job) {
         std::lock_guard<std::mutex> lock(m_);
         expired = expire_locked();
     }
+    sweep_pool(false);
     const auto t0 = std::chrono::steady_clock::now();
     Entry e = std::move(job.entry);
     std::string error;
@@ -612,8 +879,9 @@ void ConversationDiskTier::write(Job& job) {
         return;
     }
     e.at = now_();
-    const uint64_t b = e.bytes;
+    const uint64_t b = e.chunked ? e.written_bytes : e.bytes;
     const size_t nfiles = e.files.size();
+    const std::string note = e.chunk_note;
     std::string tail;
     {
         std::lock_guard<std::mutex> lock(m_);
@@ -623,8 +891,8 @@ void ConversationDiskTier::write(Job& job) {
         size_t made_room = 0, dropped = 0;
         tail = publish_locked(std::move(e), made_room, dropped);
     }
-    log(fmt("wrote %zu tokens: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); %s; %zu expired", tokens, mib(b), nfiles,
-            nfiles == 1 ? "" : "s", ms, mbps(b, ms), tail.c_str(), expired));
+    log(fmt("wrote %zu tokens: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); %s; %zu expired%s", tokens, mib(b), nfiles,
+            nfiles == 1 ? "" : "s", ms, mbps(b, ms), tail.c_str(), expired, note.c_str()));
 }
 
 bool ConversationDiskTier::write_now(const SavedConversation& image, const std::vector<SessionKvSource>* sources,
@@ -672,8 +940,9 @@ bool ConversationDiskTier::write_now(const SavedConversation& image, const std::
         return false;
     }
     e.at = now_();
-    const uint64_t b = e.bytes;
+    const uint64_t b = e.chunked ? e.written_bytes : e.bytes;
     const size_t nfiles = e.files.size();
+    const std::string note = e.chunk_note;
     std::string tail;
     {
         std::lock_guard<std::mutex> lock(m_);
@@ -684,8 +953,8 @@ bool ConversationDiskTier::write_now(const SavedConversation& image, const std::
         size_t made_room = 0, dropped = 0;
         tail = publish_locked(std::move(e), made_room, dropped);
     }
-    log(fmt("saved %zu tokens while idle: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); %s", tokens, mib(b), nfiles,
-            nfiles == 1 ? "" : "s", ms, mbps(b, ms), tail.c_str()));
+    log(fmt("saved %zu tokens while idle: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); %s%s", tokens, mib(b), nfiles,
+            nfiles == 1 ? "" : "s", ms, mbps(b, ms), tail.c_str(), note.c_str()));
     return true;
 }
 
@@ -709,6 +978,7 @@ size_t ConversationDiskTier::rescan() {
     for (size_t i = 0; i < entries_.size();) {
         if (!entries_[i].index.empty() && !present.count(entries_[i].index) && entries_[i].id != reading_) {
             bytes_ -= entries_[i].bytes;
+            release_refs(entries_[i]);
             entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
             ++gone;
             continue;
@@ -719,7 +989,7 @@ size_t ConversationDiskTier::rescan() {
     for (const auto& path : fresh) {
         seen_index_.insert(path);
         Entry e;
-        if (!read_index(path, e)) continue;   // another identity, or torn: not ours to judge here
+        if (!read_index(path, e) || !bind_chunks(e)) continue;   // another identity, torn, or a chunk is missing
         e.id = ++next_id_;
         e.at = now_();
         bytes_ += e.bytes;
@@ -728,7 +998,7 @@ size_t ConversationDiskTier::rescan() {
     }
     if (in || gone)
         log(fmt("shared folder: %zu conversation%s from other engines, %zu removed by them; on disk %zu (%.0f MiB)", in,
-                in == 1 ? "" : "s", gone, entries_.size(), mib(bytes_)));
+                in == 1 ? "" : "s", gone, entries_.size(), mib(bytes_ + pool_bytes_all())));
     return in;
 }
 
@@ -786,6 +1056,14 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     }
     const Entry want = entries_[index];
     const std::vector<std::string>& files = want.files;
+    // the chunks stay pinned while they are read: the entry leaves the list now and drops its references, but a pinned
+    // chunk is never swept; after the read the pins go and the chunks wait out their grace (a continuation of this
+    // conversation is written next and hits them)
+    std::vector<ChunkRef> pins;
+    if (want.chunked && pool_ && !keep) {
+        pins = want.refs;
+        pool_->ref(pins.data(), pins.size());
+    }
     if (keep) {
         // stays, as the newest: the budget takes the least recently used first
         Entry moved = std::move(entries_[index]);
@@ -805,7 +1083,13 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     for (size_t k = 0; ok && k < files.size(); ++k) {
         SavedConversation part;
         size_t n = 0;
-        ok = session_file_read(files[k], fid, part, n, error, limits);
+        if (want.chunked && pool_) {
+            uint64_t raw = 0;
+            ok = chunked_read(*pool_, files[k], fid, part, n, raw, error, limits, ChunkedReadOptions{0, options_.io_workers});
+            bytes += raw;
+        } else {
+            ok = session_file_read(files[k], fid, part, n, error, limits);
+        }
         bytes += n;
         if (!ok) break;
         if (k == 0) out = std::move(part);
@@ -818,6 +1102,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     const double ms = ms_since(t0);
     lock.lock();
     reading_ = 0;
+    if (!pins.empty()) pool_->unref(pins.data(), pins.size());
     if (!keep) {
         for (const auto& f : files) remove_file(f);
     } else if (!ok) {
@@ -875,7 +1160,7 @@ size_t ConversationDiskTier::size() const {
 
 uint64_t ConversationDiskTier::bytes() const {
     std::lock_guard<std::mutex> lock(m_);
-    return bytes_;
+    return bytes_ + pool_bytes_all();
 }
 
 ConversationDiskStats ConversationDiskTier::stats() const {
@@ -890,6 +1175,11 @@ size_t ConversationDiskTier::clear() {
     cv_.wait(lock, [&] { return !writing_; });
     const size_t n = queued + entries_.size();
     while (!entries_.empty()) remove_locked(0, true);
+    if (pool_ && !options_.shared) {   // #879: the chunks too, at once (a shared pool's are other engines' as well)
+        std::string why;
+        pool_->remove_all();
+        pool_->open(why);
+    }
     lock.unlock();
     if (n) log(fmt("removed all %zu conversations (#879)", n));
     return n;
@@ -898,14 +1188,21 @@ size_t ConversationDiskTier::clear() {
 std::string ConversationDiskTier::summary() const {
     std::lock_guard<std::mutex> lock(m_);
     const auto& s = stats_;
+    const std::string chunks = !pool_ ? std::string() :
+        fmt("; chunks: %llu new, %llu hit, %.0f MiB written, %.0f MiB deduplicated of %.0f MiB, %llu swept (%.0f MiB), "
+            "pool %zu (%.0f MiB), %s I/O",
+            (unsigned long long) s.chunks_new, (unsigned long long) s.chunks_hit, mib(s.new_file_bytes),
+            mib(s.dedup_bytes), mib(s.raw_bytes), (unsigned long long) s.chunks_swept, mib(s.swept_bytes), pool_->count(),
+            mib(pool_->bytes()), s.direct_io ? "direct" : "buffered");
     return fmt("totals: %zu queued, %zu written + %zu saved while idle (%.0f MiB, %.0f MB/s; %zu given way to a "
                "request), %zu RAM hits, %zu disk hits (%zu kept; %.0f MiB, %.0f MB/s), %llu prompt tokens given back, "
                "%zu waits for RAM (%.0f ms), %zu expired, %zu removed for the budget, %zu superseded, %zu/%zu "
-               "writes/reads failed; on disk %zu (%.0f MiB), queue %zu",
+               "writes/reads failed; on disk %zu (%.0f MiB), queue %zu%s",
                s.queued, s.written, s.synced, mib(s.bytes_written), mbps(s.bytes_written, s.write_ms),
                s.sync_cancelled, s.ram_hits, s.disk_hits, s.kept, mib(s.bytes_read), mbps(s.bytes_read, s.read_ms),
                (unsigned long long) s.tokens_back, s.waits, s.wait_ms, s.expired, s.evicted, s.superseded,
-               s.write_failed, s.read_failed, entries_.size(), mib(bytes_), queue_.size() + (writing_ ? 1 : 0));
+               s.write_failed, s.read_failed, entries_.size(), mib(bytes_ + pool_bytes_all()),
+               queue_.size() + (writing_ ? 1 : 0), chunks.c_str());
 }
 
 }  // namespace strata::core
