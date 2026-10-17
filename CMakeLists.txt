@@ -251,6 +251,12 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   find_package(Threads REQUIRED)   # the tier's background writer
   target_link_libraries(conversation_disk_test PRIVATE Threads::Threads)
   add_test(NAME conversation_disk_test COMMAND conversation_disk_test)
+  # the chunked, deduplicated format of the disk tier (conversation_chunks.hpp): chunks, pool, manifest, limits
+  add_executable(conversation_chunks_test src/core/conversation_chunks_test.cpp src/core/conversation_chunks.cpp
+                 src/core/conversation_codec.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_chunks_test PRIVATE include)
+  target_link_libraries(conversation_chunks_test PRIVATE Threads::Threads)
+  add_test(NAME conversation_chunks_test COMMAND conversation_chunks_test)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)

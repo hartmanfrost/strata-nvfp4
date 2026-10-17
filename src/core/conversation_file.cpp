@@ -867,6 +867,26 @@ uint64_t SessionHasher::digest() const {
     return h;
 }
 
+std::array<uint8_t, 16> SessionHasher::digest128() const {
+    const uint64_t lo = digest();
+    // a different mix of the same state: other lane order and rotations, other primes, a murmur3-style finalizer
+    uint64_t h = P5 ^ (total_ * P3);
+    for (int i = 0; i < 4; ++i) {
+        h ^= round1(lane_[(i + 1) & 3] ^ (P4 * uint64_t(i + 1)), lane_[i]);
+        h = rotl(h, 23 + 5 * i) * P2 + P1;
+    }
+    size_t i = 0;
+    for (; i + 8 <= npending_; i += 8) { h ^= round1(P3, load64(pending_ + i)); h = rotl(h, 31) * P2 + P5; }
+    for (; i < npending_; ++i) { h ^= (pending_[i] + 1u) * P3; h = rotl(h, 13) * P2; }
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ull; h ^= h >> 33;
+    std::array<uint8_t, 16> out{};
+    for (int b = 0; b < 8; ++b) {   // little-endian on every host: the chunk names and keys are the same everywhere
+        out[(size_t) b] = (uint8_t) (lo >> (8 * b));
+        out[(size_t) b + 8] = (uint8_t) (h >> (8 * b));
+    }
+    return out;
+}
+
 uint64_t session_hash64(const void* data, size_t n, uint64_t seed) {
     SessionHasher h(seed);
     h.update(data, n);

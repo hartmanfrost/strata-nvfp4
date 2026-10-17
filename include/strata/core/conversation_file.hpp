@@ -33,6 +33,10 @@ public:
     explicit SessionHasher(uint64_t seed = 0);
     void update(const void* data, size_t n);
     uint64_t digest() const;
+    // 128 bits from the same four lanes and the same pass (no second walk over the data): digest() is the low half,
+    // the high half is a second finalizer with other rotations and constants.  Stored as a little-endian u128
+    // (low half first); the chunk key of conversation_chunks.hpp.  Fixed by the golden test of that file.
+    std::array<uint8_t, 16> digest128() const;
 private:
     void block(const uint8_t* p);
     uint64_t lane_[4];
