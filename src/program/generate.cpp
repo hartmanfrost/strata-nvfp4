@@ -1150,6 +1150,9 @@ struct Options {
     /// (conversation_chunks.hpp; docs/NVFP4.md "Chunked parked dialogs").  Reading takes either format.
     bool conversation_disk_chunked = false;
     int64_t conversation_disk_chunk_tokens = 512;   ///< --conversation-disk-chunk-tokens: tokens of K/V per chunk
+    /// --conversation-disk-codec raw|zstd[:level]: how the chunks are stored (zstd needs a build with STRATA_DISK_ZSTD)
+    strata::core::ChunkCodec conversation_disk_codec = strata::core::ChunkCodec::raw;
+    int conversation_disk_codec_level = 1;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1361,6 +1364,9 @@ void usage() {
                  "                       unreferenced chunk is deleted after 10 min; default off = one file each)\n"
                  "  --conversation-disk-chunk-tokens N  --serve, with --conversation-disk-chunked: tokens of K/V per\n"
                  "                       chunk (a multiple of 4, 64..4096; default 512)\n"
+                 "  --conversation-disk-codec raw|zstd[:LEVEL]  --serve, with --conversation-disk-chunked: how chunks\n"
+                 "                       are stored: raw (default; a compressing filesystem such as btrfs does the rest) or\n"
+                 "                       zstd (default level 1, 1..19: byte-shuffled, tried per part, kept only where it pays)\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
@@ -4063,6 +4069,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.conversation_disk_chunk_tokens = number;
+        }
+        else if (a == "--conversation-disk-codec") {
+            std::string why;
+            if (!strata::core::conversation_disk_parse_codec(next("--conversation-disk-codec"), o.conversation_disk_codec,
+                                                             o.conversation_disk_codec_level, why)) {
+                std::fprintf(stderr, "--conversation-disk-codec: %s\n", why.c_str());
+                return 2;
+            }
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
@@ -14147,6 +14161,8 @@ int main(int argc, char** argv) {
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
         disk_opts.chunked = o.conversation_disk_chunked;
         disk_opts.chunk_tokens = (uint32_t) o.conversation_disk_chunk_tokens;
+        disk_opts.codec = o.conversation_disk_codec;
+        disk_opts.codec_level = o.conversation_disk_codec_level;
         if (o.conversation_disk_persist && !disk_opts.dir.empty()) {
             // the session files' identity: a later start with the same model and settings takes the files in
             std::string id_err;

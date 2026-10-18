@@ -3,7 +3,12 @@
 
 #include <algorithm>
 #include <bit>
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -16,14 +21,17 @@
 #include <mutex>
 #include <new>
 #include <random>
+#include <system_error>
 #include <set>
 #include <unordered_map>
 #ifdef _WIN32
 #include <malloc.h>
 #else
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
@@ -106,7 +114,7 @@ void make_header(uint8_t* h, uint32_t raw_len, uint32_t stored_len, ChunkCodec c
     put_le<uint32_t>(h + 8, raw_len);
     put_le<uint32_t>(h + 12, stored_len);
     h[16] = (uint8_t) codec;
-    h[17] = shuffled ? 1 : 0;
+    h[17] = (codec != ChunkCodec::raw ? 2 : 0) | (shuffled ? 1 : 0);   // bit1: segmented container (every non-raw codec)
     put_le<uint16_t>(h + 18, (uint16_t) kind);
     std::memcpy(h + 24, key.b.data(), 16);
     put_le<uint64_t>(h + 40, session_hash64(h, 40, 0));
@@ -129,7 +137,8 @@ const char* parse_header(const uint8_t* h, Hdr& out) {
     out.stored_len = get_le<uint32_t>(h + 12);
     const uint8_t codec = h[16], flags = h[17];
     if (codec != (uint8_t) ChunkCodec::raw && codec != (uint8_t) ChunkCodec::zstd) return "unknown codec";
-    if (flags & ~1u) return "invalid header flags";
+    if (flags & ~3u) return "invalid header flags";
+    if (((flags & 2u) != 0) != (codec != (uint8_t) ChunkCodec::raw)) return "invalid header flags";
     out.codec = (ChunkCodec) codec;
     out.shuffled = (flags & 1u) != 0;
     out.kind = get_le<uint16_t>(h + 18);
@@ -322,6 +331,7 @@ struct ChunkPool::Impl {
     uint64_t bytes = 0;
     std::set<std::string> touched;      // shard names; "" = the pool folder itself
     std::mutex sync_mu;                 // one sync_touched_shards at a time, held until its fsyncs are done
+    AdaptiveSkip skip;                  // which kinds of data the codec is tried on
     bool opened = false;
 
     int64_t now() const { return o.clock_s ? o.clock_s() : (int64_t) std::time(nullptr); }
@@ -530,7 +540,8 @@ bool ChunkPool::open(std::string& error) {
 }
 
 bool ChunkPool::put_buffer(ChunkKind kind, ChunkBuffer& buf, size_t raw_len, uint8_t shuffle_width, ChunkRef& out,
-                           ChunkPutInfo& info, std::string& error, bool durable) {
+                           ChunkPutInfo& info, std::string& error, bool durable,
+                           const std::vector<CodecSegment>* segments) {
     auto& p = *p_;
     info = {};
     error.clear();
@@ -606,19 +617,29 @@ bool ChunkPool::put_buffer(ChunkKind kind, ChunkBuffer& buf, size_t raw_len, uin
     uint32_t stored_len = (uint32_t) raw_len;
     ChunkCodec codec = ChunkCodec::raw;
     bool shuffled = false;
-    if (p.o.codec != ChunkCodec::raw && codec_available(p.o.codec)) {
+    if (p.o.codec != ChunkCodec::raw && codec_available(p.o.codec) && raw_len) {
+        // the segments the codec treats separately (K/V parts differ in element width and compressibility); without a
+        // plan the chunk is one segment of the given width
+        std::vector<CodecSegment> one;
+        if (!segments) {
+            one.push_back({(uint32_t) raw_len, shuffle_width, (uint8_t) (kind == ChunkKind::state_slice ? 5 : 6)});
+            segments = &one;
+        }
         std::vector<uint8_t> enc;
-        bool stored_raw = true;
-        if (!codec_encode(p.o.codec, p.o.zstd_level, shuffle_width, buf.payload(), raw_len, enc, stored_raw)) {
+        bool any_shuffled = false;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!segmented_encode(p.o.zstd_level, segments->data(), segments->size(), buf.payload(), raw_len, &p.skip, enc,
+                              any_shuffled)) {
             info.error_kind = SessionError::io;
             error = "chunk: the encoder failed";
             return false;
         }
-        if (!stored_raw && enc.size() < raw_len) {
+        info.encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (enc.size() < raw_len) {
             std::memcpy(buf.payload(), enc.data(), enc.size());
             stored_len = (uint32_t) enc.size();
             codec = p.o.codec;
-            shuffled = shuffle_width != 0;
+            shuffled = any_shuffled;
         }
     }
     const uint64_t file_size = chunk_file_size(stored_len);
@@ -732,9 +753,13 @@ bool ChunkPool::get(ChunkKind kind, const ChunkRef& ref, void* dst, size_t dst_c
         return true;
     }
     if (!codec_available(h.codec)) return fail(SessionError::invalid, "codec not available in this build");
-    if (!codec_decode(h.codec, h.shuffled, 0, payload, h.stored_len, dst, h.raw_len))
-        return fail(SessionError::invalid, "decode failed");
-    if (!(chunk_key(dst, h.raw_len) == ref.key)) return fail(SessionError::invalid, "content hash mismatch");
+    bool decoder_unavailable = false;
+    if (!segmented_decode(payload, h.stored_len, dst, h.raw_len, &decoder_unavailable)) {
+        // the decoder could not get memory: nothing is known about the file, so it stays where it is
+        if (decoder_unavailable) return fail(SessionError::memory, "out of memory for the decoder");
+        return corrupt("decode failed");
+    }
+    if (!(chunk_key(dst, h.raw_len) == ref.key)) return corrupt("content hash mismatch");
     return true;
 }
 
@@ -1310,34 +1335,167 @@ bool write_impl(ChunkPool& pool, const std::string& path, const SavedConversatio
         ~Release() { if (!ok && !refs.empty()) pool.unref(refs.data(), refs.size()); }
     } release{pool, refs, ok};
 
-    ChunkBuffer buf;
+    // The chunk pipeline.  The calling thread gathers each chunk's raw bytes (a K/V source reads the device, which stays
+    // on this thread) into a staging buffer; with workers > 1 the hash, the codec and the disk write of a full buffer run
+    // on worker threads, at most workers + 1 buffers in flight (the gathering waits for a free one).  Results land at
+    // the chunk's index, so the manifest order does not depend on who finished first.
+    size_t n_chunks = (size_t) plan.n_slabs;
+    for (const auto& m : metas) n_chunks += m.n_slices;
+    std::vector<ChunkRef> results(n_chunks);
+    std::vector<char> have(n_chunks, 0);
+    int n_workers = std::clamp(opt.workers, 1, 8);
+    struct Job {
+        ChunkBuffer buf;
+        size_t index = 0, raw_len = 0;
+        ChunkKind kind = ChunkKind::kv_slab;
+        uint8_t width = 0;
+        std::vector<CodecSegment> segs;
+    };
+    std::mutex mu;
+    std::mutex cancel_mu;   // the caller's cancel hook is asked from the workers too: never two at once
+    auto cancelled = [&]() -> bool {
+        if (!opt.cancel) return false;
+        std::lock_guard<std::mutex> g(cancel_mu);
+        return opt.cancel();
+    };
+    std::condition_variable cv;
+    std::deque<Job> queue;
+    std::vector<ChunkBuffer> spare_bufs;
+    int made_bufs = 0, busy = 0;
+    std::atomic<bool> failed{false};
+    bool stopping = false;
+    SessionError fail_kind = SessionError::io;
+    std::string fail_msg;
     uint64_t done = 0;
     if (opt.progress) opt.progress(0, chunk_raw_total);
-    auto emit = [&](ChunkKind kind, size_t raw_len, uint8_t width, const auto& fill) -> bool {
-        if (opt.cancel && opt.cancel()) { st.error = SessionError::io; error = "chunked session: cancelled"; return false; }
-        if (!buf.reserve(raw_len)) { st.error = SessionError::memory; error = "chunked session: out of memory for the chunk buffer"; return false; }
-        if (!fill(buf.payload())) return false;
+
+    auto note_failure = [&](SessionError k, const std::string& m) {   // first failure wins
+        std::lock_guard<std::mutex> g(mu);
+        if (!failed) { failed = true; fail_kind = k; fail_msg = m; }
+        cv.notify_all();
+    };
+    auto run_job = [&](Job& j) {
+      try {
+        // (inline, the gathering has just asked; a worker asks again before the hash and the write)
+        if (n_workers > 1 && cancelled()) { note_failure(SessionError::io, "chunked session: cancelled"); return; }
         ChunkRef ref;
         ChunkPutInfo info;
         const auto t0 = Clock::now();
         std::string why;
-        const bool put_ok = pool.put_buffer(kind, buf, raw_len, width, ref, info, why, opt.durable);
-        stats.io_ms += ms_since(t0);
-        if (!put_ok) { st.error = info.error_kind; error = "chunked session: " + why; return false; }
-        refs.push_back(ref);
+        const bool put_ok = pool.put_buffer(j.kind, j.buf, j.raw_len, j.width, ref, info, why, opt.durable,
+                                            j.segs.empty() ? nullptr : &j.segs);
+        const double took = ms_since(t0);
+        if (!put_ok) { note_failure(info.error_kind, "chunked session: " + why); return; }
+        std::lock_guard<std::mutex> g(mu);
+        results[j.index] = ref;
+        have[j.index] = 1;
         ++stats.chunks;
-        stats.raw_bytes += raw_len;
-        if (info.hit) { ++stats.hits; stats.hit_raw_bytes += raw_len; } else { ++stats.misses; stats.new_file_bytes += info.new_file_bytes; }
+        stats.raw_bytes += j.raw_len;
+        stats.io_ms += took;
+        stats.encode_ms += info.encode_ms;
+        if (info.hit) { ++stats.hits; stats.hit_raw_bytes += j.raw_len; } else { ++stats.misses; stats.new_file_bytes += info.new_file_bytes; }
         if (info.direct_io) stats.direct_io = true;
-        done += raw_len;
-        if (opt.progress) opt.progress(done, chunk_raw_total);
+        done += j.raw_len;
+        if (opt.progress) opt.progress(done, chunk_raw_total);   // (under the lock: the callback is never concurrent)
+      } catch (const std::bad_alloc&) {
+        note_failure(SessionError::memory, "chunked session: out of memory in the chunk pipeline");
+      } catch (const std::exception& e) {
+        note_failure(SessionError::io, std::string("chunked session: ") + e.what());
+      }
+    };
+    std::vector<std::thread> threads;
+    // stops the workers and moves the references of the chunks done so far into `refs`, in manifest order (once); every
+    // exit path runs it, so a failure's Release below gives all of them back
+    bool collected = false;
+    auto collect = [&] {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            stopping = true;
+            cv.notify_all();
+        }
+        for (auto& t : threads) t.join();
+        threads.clear();
+        if (collected) return;
+        collected = true;
+        for (size_t i = 0; i < have.size(); ++i) if (have[i]) refs.push_back(results[i]);
+    };
+    struct Joiner { std::function<void()> f; ~Joiner() { f(); } } joiner{collect};
+    if (n_workers > 1) {
+        for (int w = 0; w < n_workers; ++w) {
+          try {
+            threads.emplace_back([&] {
+                // off the host thread's core (an idle save runs on the host thread, whose one CPU a new thread inherits)
+                strata::aux_cpus::spread_current_thread();
+#if defined(__linux__)
+                if (opt.low_priority) (void) ::setpriority(PRIO_PROCESS, (id_t) ::syscall(SYS_gettid), 5);   // a background write yields to the engine
+#endif
+                for (;;) {
+                    Job j;
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv.wait(lk, [&] { return stopping || !queue.empty(); });
+                        if (queue.empty()) return;   // stopping and drained
+                        j = std::move(queue.front());
+                        queue.pop_front();
+                        ++busy;
+                    }
+                    if (!failed) run_job(j);   // (a read of `failed` racing a failure only costs one more chunk)
+                    {
+                        std::lock_guard<std::mutex> g(mu);
+                        spare_bufs.push_back(std::move(j.buf));
+                        --busy;
+                        cv.notify_all();
+                    }
+                }
+            });
+          } catch (const std::system_error&) { break; }   // no more threads: go on with the ones there are
+        }
+        n_workers = std::max<int>(1, (int) threads.size());
+        if (threads.empty()) n_workers = 1;   // (inline: the calling thread does it all)
+    }
+    size_t next_index = 0;
+    // gathers one chunk (fill on this thread), then hands it to the pipeline; false: the write is given up
+    auto emit = [&](ChunkKind kind, size_t raw_len, uint8_t width, std::vector<CodecSegment>* segs, const auto& fill) -> bool {
+        if (cancelled()) { st.error = SessionError::io; error = "chunked session: cancelled"; return false; }
+        Job j;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            if (n_workers > 1) {
+                cv.wait(lk, [&] { return failed || !spare_bufs.empty() || made_bufs < n_workers + 1; });
+            }
+            if (failed) { st.error = fail_kind; error = fail_msg; return false; }
+            if (!spare_bufs.empty()) { j.buf = std::move(spare_bufs.back()); spare_bufs.pop_back(); }
+            else ++made_bufs;
+        }
+        if (!j.buf.reserve(raw_len)) { st.error = SessionError::memory; error = "chunked session: out of memory for the chunk buffer"; return false; }
+        if (!fill(j.buf.payload())) return false;
+        j.index = next_index++;
+        j.raw_len = raw_len;
+        j.kind = kind;
+        j.width = width;
+        if (segs) j.segs = std::move(*segs);
+        if (n_workers > 1) {
+            std::lock_guard<std::mutex> g(mu);
+            queue.push_back(std::move(j));
+            cv.notify_all();
+            return true;
+        }
+        run_job(j);
+        std::lock_guard<std::mutex> g(mu);
+        if (failed) { st.error = fail_kind; error = fail_msg; return false; }
+        return true;
+    };
+    auto finish = [&]() -> bool {
+        collect();
+        if (failed) { st.error = fail_kind; error = fail_msg; return false; }
         return true;
     };
 
     std::string read_error;
     for (uint64_t i = 0; i < plan.n_slabs; ++i) {
         const size_t len = (size_t) plan.slab_len(i);
-        const bool good = emit(ChunkKind::kv_slab, len, 0, [&](uint8_t* dst) {
+        std::vector<CodecSegment> segs;
+        const bool good = emit(ChunkKind::kv_slab, len, 0, &segs, [&](uint8_t* dst) {
             size_t at = 0;
             for (size_t part = 0; part < 5; ++part)
                 for (size_t l = 0; l < plan.L.size(); ++l) {
@@ -1359,20 +1517,30 @@ bool write_impl(ChunkPool& pool, const std::string& path, const SavedConversatio
                         error = "chunked session: K/V source read" + (read_error.empty() ? std::string() : ": " + read_error);
                         return false;
                     }
+                    // one codec segment per part (the layers' bytes of a part are adjacent and of one width)
+                    const uint8_t w = plan.L[l].widths[part];
+                    if (!segs.empty() && segs.back().kind == part && segs.back().width == w && segs.back().len + n <= UINT32_MAX)
+                        segs.back().len += (uint32_t) n;
+                    else
+                        segs.push_back({(uint32_t) n, w, (uint8_t) part});
                     at += (size_t) n;
                 }
             return true;
         });
-        if (!good) return false;
+        if (!good) { collect(); return false; }
     }
     for (size_t i = 0; i < cps.size(); ++i) {
         const auto& gdn = cps[i]->gdn;
         for (uint32_t j = 0; j < metas[i].n_slices; ++j) {
             const size_t off = (size_t) j * kStateSlice, n = std::min<size_t>(kStateSlice, gdn.size() - off);
-            if (!emit(ChunkKind::state_slice, n, 4, [&](uint8_t* dst) { std::memcpy(dst, gdn.data() + off, n); return true; }))
+            if (!emit(ChunkKind::state_slice, n, 4, nullptr, [&](uint8_t* dst) { std::memcpy(dst, gdn.data() + off, n); return true; })) {
+                collect();
                 return false;
+            }
         }
     }
+    if (!finish()) return false;
+    if (refs.size() != n_chunks) { st.error = SessionError::io; error = "chunked session: a chunk is missing from the pipeline"; return false; }
     // slice refs back into the checkpoints' metas, in the order they were emitted
     size_t at = plan.n_slabs;
     std::vector<ChunkRef> slabs(refs.begin(), refs.begin() + (std::ptrdiff_t) plan.n_slabs);
@@ -1612,46 +1780,94 @@ bool read_impl(ChunkPool& pool, const std::string& path, const SessionFileIdenti
         k.k_scale.resize((size_t) p.plan.L[l].sizes[2]); k.v_scale.resize((size_t) p.plan.L[l].sizes[3]);
         k.pooled.resize((size_t) p.plan.L[l].sizes[4]);
     }
+    // The chunks are independent: workers fetch, verify and decode them (each into its own scratch, then into its own
+    // disjoint range of the image), the first failure stops the rest.  The spare rows come from the manifest.
+    std::mutex mu;
+    std::string first_error;
+    SessionError first_kind = SessionError::invalid;
+    std::atomic<bool> failed{false};
+    auto fail = [&](SessionError k, const std::string& m) {
+        std::lock_guard<std::mutex> g(mu);
+        if (!failed) { failed = true; first_kind = k; first_error = m; }
+    };
     auto get = [&](ChunkKind kind, const ChunkRef& r, void* dst, size_t cap) {
         SessionError kind_err = SessionError::invalid;
-        if (!pool.get(kind, r, dst, cap, error, &kind_err)) { st.error = kind_err; return false; }
+        std::string why;
+        if (!pool.get(kind, r, dst, cap, why, &kind_err)) { fail(kind_err, why); return false; }
+        std::lock_guard<std::mutex> g(mu);
         done += r.raw_len;
         raw_bytes_read += r.raw_len;
         if (limits.progress) limits.progress(done, total);
         return true;
     };
-    std::vector<uint8_t> scratch;
-    for (uint64_t i = 0; i < p.plan.n_slabs; ++i) {
-        const ChunkRef& r = p.slabs[(size_t) i];
-        scratch.resize(r.raw_len);
-        if (!get(ChunkKind::kv_slab, r, scratch.data(), scratch.size())) return false;
-        size_t at = 0;
-        for (size_t part = 0; part < 5; ++part)
-            for (size_t l = 0; l < img.kv.size(); ++l) {
-                uint64_t off, n;
-                p.plan.slice(l, part, i, off, n);
-                if (!n) continue;
-                auto& k = img.kv[l];
-                ConversationBuffer* b[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
-                if (!write_buffer_at(*b[part], off, scratch.data() + at, n)) { error = "chunked session: slab does not fit its part"; return false; }
-                at += (size_t) n;
-            }
+    struct Task { size_t cp = 0; uint32_t j = 0; };   // cp = SIZE_MAX: a K/V slab, j = its index
+    std::vector<Task> tasks;
+    for (uint64_t i = 0; i < p.plan.n_slabs; ++i) tasks.push_back({SIZE_MAX, (uint32_t) i});
+    for (size_t i = 0; i < p.cps.size(); ++i) {
+        ConversationCheckpoint& cp = i == 0 ? img.live : img.checkpoints[i - 1];
+        cp.gdn.resize((size_t) p.cps[i].gdn_len);
+        for (uint32_t j = 0; j < p.cps[i].n_slices; ++j) tasks.push_back({i, j});
     }
+    auto run = [&](const Task& t, std::vector<uint8_t>& scratch) {
+        try {
+            if (t.cp != SIZE_MAX) {
+                ConversationCheckpoint& cp = t.cp == 0 ? img.live : img.checkpoints[t.cp - 1];
+                const CkptMeta& m = p.cps[t.cp];
+                const size_t off = (size_t) t.j * m.slice_len;
+                get(ChunkKind::state_slice, m.refs[t.j], cp.gdn.data() + off, cp.gdn.size() - off);
+                return;
+            }
+            const uint64_t i = t.j;
+            const ChunkRef& r = p.slabs[(size_t) i];
+            scratch.resize(r.raw_len);
+            if (!get(ChunkKind::kv_slab, r, scratch.data(), scratch.size())) return;
+            size_t at = 0;
+            for (size_t part = 0; part < 5; ++part)
+                for (size_t l = 0; l < img.kv.size(); ++l) {
+                    uint64_t off, n;
+                    p.plan.slice(l, part, i, off, n);
+                    if (!n) continue;
+                    auto& k = img.kv[l];
+                    ConversationBuffer* b[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                    if (!write_buffer_at(*b[part], off, scratch.data() + at, n)) { fail(SessionError::invalid, "chunked session: slab does not fit its part"); return; }
+                    at += (size_t) n;
+                }
+        } catch (const std::bad_alloc&) {
+            fail(SessionError::memory, "chunked session: out of memory while reading a chunk");
+        } catch (const std::exception& e) {
+            fail(SessionError::io, std::string("chunked session: ") + e.what());
+        }
+    };
+    const size_t n_workers = std::min<size_t>((size_t) std::clamp(opt.workers, 1, 8), tasks.size());
+    if (n_workers <= 1) {
+        std::vector<uint8_t> scratch;
+        for (const Task& t : tasks) { if (failed) break; run(t, scratch); }
+    } else {
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> threads;
+        for (size_t w = 0; w < n_workers; ++w) {
+            try {
+                threads.emplace_back([&] {
+                    // off the host thread's core: a read back runs on the host thread, whose one CPU a new thread inherits
+                    strata::aux_cpus::spread_current_thread();
+                    std::vector<uint8_t> scratch;
+                    for (size_t i; !failed && (i = next.fetch_add(1)) < tasks.size();) run(tasks[i], scratch);
+                });
+            } catch (const std::system_error&) { break; }
+        }
+        {   // the calling thread works too: with no thread made it is the only one
+            std::vector<uint8_t> scratch;
+            for (size_t i; !failed && (i = next.fetch_add(1)) < tasks.size();) run(tasks[i], scratch);
+        }
+        for (auto& t : threads) t.join();
+    }
+    if (failed) { st.error = first_kind; error = first_error; return false; }
     for (size_t l = 0; l < img.kv.size(); ++l)
         if (!p.spare[l].empty() &&
             !write_buffer_at(img.kv[l].pooled, p.plan.data_rows[l] * p.plan.row[l], p.spare[l].data(), p.spare[l].size())) {
             error = "chunked session: the spare row does not fit";
             return false;
         }
-    for (size_t i = 0; i < p.cps.size(); ++i) {
-        ConversationCheckpoint& cp = i == 0 ? img.live : img.checkpoints[i - 1];
-        const CkptMeta& m = p.cps[i];
-        cp.gdn.resize((size_t) m.gdn_len);
-        for (uint32_t j = 0; j < m.n_slices; ++j) {
-            const size_t off = (size_t) j * m.slice_len;
-            if (!get(ChunkKind::state_slice, m.refs[j], cp.gdn.data() + off, cp.gdn.size() - off)) return false;
-        }
-    }
     out = std::move(img);
     manifest_bytes = (size_t) ld.file_bytes;
     st.error = SessionError::none;

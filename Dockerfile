@@ -24,7 +24,7 @@ ARG RUNTIME_BASE=ubuntu:24.04
 FROM ${CUDA_IMAGE} AS engine-build
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PATH=/venv/bin:$PATH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates git libgomp1 libatomic1 python3 python3-pip python3-venv unzip \
+        build-essential ca-certificates git libgomp1 libatomic1 libzstd-dev python3 python3-pip python3-venv unzip \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
@@ -39,7 +39,7 @@ RUN set -e; \
     sm60=OFF; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do if [ "$a" -lt 75 ]; then sm60=ON; fi; done; \
     /venv/bin/cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
         -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
-        -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
+        -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_DISK_ZSTD=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
     . packaging/engine_targets.sh; targets=$(engine_targets /venv/bin/cmake build); \
     /venv/bin/cmake --build build --target $targets -j "$(nproc)"; \
@@ -62,7 +62,7 @@ RUN set -e; \
     archs=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do archs="$archs --arch sm_$a"; done; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
     python3 packaging/package_engine.py --src /stage --backend cuda --version "$ver" --out /engine $archs --arch "compute_$last" \
-        --min-driver nvidia=$mindriver --variant cuda$cudamajor --platform linux-x86_64 --build-id "docker-source-${ver}-cuda${cudafull}" --include SYSTEM-LIBS.txt --include 'libstrata_kq*' \
+        --min-driver nvidia=$mindriver --variant cuda$cudamajor --platform linux-x86_64 --build-id "docker-source-${ver}-cuda${cudafull}" --include SYSTEM-LIBS.txt --include 'libstrata_kq*' --include 'licenses/*' \
         --include strata-vision; \
     for d in /engine/*/; do python3 packaging/package_engine.py --verify "$d"; python3 packaging/binary_deps.py "$d"; done
 

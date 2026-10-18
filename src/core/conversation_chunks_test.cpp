@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -33,10 +35,11 @@ void check(bool ok, const char* label) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
 }
 
+bool g_low_entropy = false;   // make_image / fill: bytes of 3 bits of entropy, so a codec has something to find
 uint8_t hb(uint64_t seed, uint64_t i) {
     uint64_t x = (i + 1) * 0x9E3779B97F4A7C15ull ^ (seed * 0xD6E8FEB86659FD93ull);
     x ^= x >> 32; x *= 0xD6E8FEB86659FD93ull; x ^= x >> 32;
-    return (uint8_t) x;
+    return g_low_entropy ? (uint8_t) (x & 7) : (uint8_t) x;
 }
 ConversationBuffer fill_buf(size_t n, uint64_t seed) {
     ConversationBuffer b;
@@ -196,6 +199,8 @@ struct Fx {
     std::vector<std::string> steps;
     std::mutex steps_mu;   // the pool calls the hook from every writer thread
     std::function<int(const char*)> fault;
+    ChunkCodec codec = ChunkCodec::raw;
+    int level = 1;
     explicit Fx(const std::string& name, bool direct = true, int64_t grace = 600) {
         root = fs::temp_directory_path() / (own_prefix() + name + "-" +
                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -210,6 +215,8 @@ struct Fx {
         o.direct = direct;
         o.grace_s = grace;
         o.min_free_bytes = min_free;
+        o.codec = codec;
+        o.zstd_level = level;
         o.clock_s = [this] { return clock; };
         o.fault = [this](const char* s) { { std::lock_guard<std::mutex> g(steps_mu); steps.push_back(s); } return fault ? fault(s) : 0; };
         pool = std::make_unique<ChunkPool>(o);
@@ -1286,6 +1293,786 @@ void test_write_failures() {
 }
 } // namespace
 
+// ------------------------------------------------------------------------------------------------ codec, pipeline
+
+std::vector<uint8_t> shuffled_of(const std::vector<uint8_t>& v, uint8_t w) {
+    std::vector<uint8_t> o(v.size());
+    shuffle_bytes(v.data(), o.data(), v.size(), w);
+    return o;
+}
+
+void test_shuffle_and_skip() {
+    // the layout: plane b holds byte b of every element; a tail stays
+    const std::vector<uint8_t> a{0xa0, 0xa1, 0xa2, 0xa3, 0xb0, 0xb1, 0xb2, 0xb3, 0xee, 0xff};
+    check(shuffled_of(a, 4) == std::vector<uint8_t>({0xa0, 0xb0, 0xa1, 0xb1, 0xa2, 0xb2, 0xa3, 0xb3, 0xee, 0xff}), "shuffle width 4 layout, tail kept");
+    check(shuffled_of(a, 2) == std::vector<uint8_t>({0xa0, 0xa2, 0xb0, 0xb2, 0xee, 0xa1, 0xa3, 0xb1, 0xb3, 0xff}), "shuffle width 2 layout");
+    check(shuffled_of(a, 0) == a && shuffled_of(a, 1) == a, "width 0 and 1 copy");
+    for (uint8_t w : {0, 1, 2, 3, 4, 5, 8})
+        for (size_t n : {0, 1, 3, 7, 64, 1001, 4099}) {
+            const auto v = fill_vec(n, 9 + w);
+            std::vector<uint8_t> sh = shuffled_of(v, w), back(n);
+            unshuffle_bytes(sh.data(), back.data(), n, w);
+            check(back == v, "unshuffle(shuffle(x)) == x");
+            if (n >= (size_t) w && w > 1) {
+                std::multiset<uint8_t> x(v.begin(), v.end()), y(sh.begin(), sh.end());
+                check(x == y, "a shuffle permutes the bytes");
+            }
+        }
+    // adaptive skip
+    AdaptiveSkip sk;
+    check(!sk.attempt(0, 1000) && !sk.attempt(0, AdaptiveSkip::kMinSegment - 1), "a small segment is never tried");
+    check(sk.attempt(0, AdaptiveSkip::kMinSegment), "a fresh kind is tried");
+    sk.record(0, 1000000, 990000);
+    check(sk.ratio(0) > 0.93, "the ratio is recorded");
+    int tried = 0;
+    for (int i = 0; i < 16; ++i) tried += sk.attempt(0, 1 << 20) ? 1 : 0;
+    check(tried == 2, "a kind that does not pay is probed every 8th time");
+    check(sk.attempt(1, 1 << 20), "kinds are independent");
+    for (int i = 0; i < 8; ++i) sk.record(0, 1000000, 400000);
+    check(sk.ratio(0) < 0.5 && sk.attempt(0, 1 << 20), "a kind that pays is tried again");
+    // concurrent use (a data race here is what the TSAN run is for)
+    std::vector<std::thread> th;
+    for (int t = 0; t < 4; ++t) th.emplace_back([&] { for (int i = 0; i < 2000; ++i) { sk.attempt(i % 8, 1 << 20); sk.record(i % 8, 100000, 50000 + i % 40000); } });
+    for (auto& t : th) t.join();
+    check(true, "concurrent skip use");
+}
+
+std::vector<uint8_t> seg(uint32_t rl, uint32_t sl, uint8_t mode, uint8_t width, const std::vector<uint8_t>& body, uint16_t rsv = 0) {
+    std::vector<uint8_t> o(12);
+    wr<uint32_t>(o, 0, rl); wr<uint32_t>(o, 4, sl); o[8] = mode; o[9] = width; wr<uint16_t>(o, 10, rsv);
+    o.insert(o.end(), body.begin(), body.end());
+    return o;
+}
+std::vector<uint8_t> cat(std::vector<uint8_t> a, const std::vector<uint8_t>& b) { a.insert(a.end(), b.begin(), b.end()); return a; }
+
+void test_codec_units() {
+    check(codec_available(ChunkCodec::raw) && !codec_available(ChunkCodec::lz4), "raw is always there, lz4 never");
+    const bool zs = codec_available(ChunkCodec::zstd);
+    std::printf("  zstd in this build: %s\n", zs ? "yes" : "no");
+    // raw decode
+    {
+        const auto v = fill_vec(100, 1);
+        std::vector<uint8_t> out(100);
+        check(codec_decode(ChunkCodec::raw, false, 0, v.data(), 100, out.data(), 100) && out == v, "raw decode");
+        check(!codec_decode(ChunkCodec::raw, false, 0, v.data(), 99, out.data(), 100), "raw decode refuses a length mismatch");
+        check(!codec_decode(ChunkCodec::raw, true, 4, v.data(), 100, out.data(), 100), "raw decode refuses a shuffled flag");
+        check(!codec_decode(ChunkCodec::lz4, false, 0, v.data(), 100, out.data(), 100), "lz4 is refused");
+    }
+    // the container without a codec: raw segments decode in every build; anything else is refused cleanly
+    {
+        const auto x = fill_vec(300, 2), y = fill_vec(500, 3);
+        auto good = cat(seg(300, 300, 0, 0, x), seg(500, 500, 0, 0, y));
+        std::vector<uint8_t> out(800), want = x;
+        want.insert(want.end(), y.begin(), y.end());
+        check(segmented_decode(good.data(), good.size(), out.data(), 800) && out == want, "a container of raw segments decodes");
+        auto bad = [&](const std::vector<uint8_t>& c, size_t rl, const char* label) {
+            std::vector<uint8_t> o(rl);
+            check(!segmented_decode(c.data(), c.size(), o.data(), rl), label);
+        };
+        bad(good, 801, "a container shorter than raw_len is refused");
+        bad(good, 799, "a container longer than raw_len is refused");
+        bad(std::vector<uint8_t>(good.begin(), good.end() - 1), 800, "a truncated container is refused");
+        bad(std::vector<uint8_t>(good.begin(), good.begin() + 11), 800, "a truncated header is refused");
+        bad(cat(good, {1, 2, 3}), 800, "trailing bytes are refused");
+        bad(seg(0, 0, 0, 0, {}), 0 + 1, "a zero-length segment is refused");
+        bad(seg(300, 301, 0, 0, fill_vec(301, 1)), 300, "raw: stored != raw is refused");
+        bad(seg(300, 300, 0, 4, x), 300, "raw: a width is refused");
+        bad(seg(300, 300, 0, 0, x, 1), 300, "reserved bytes must be zero");
+        bad(seg(300, 300, 9, 0, x), 300, "an unknown mode is refused");
+        bad(seg(300, 5000, 0, 0, x), 300, "a stored length past the end is refused");
+        bad(seg(900, 900, 0, 0, fill_vec(900, 1)), 800, "a raw length past the capacity is refused");
+        bad(seg(300, 40, 1, 0, fill_vec(40, 4)), 300, "a bogus zstd frame is refused (or no zstd here)");
+        bad(seg(300, 40, 2, 4, fill_vec(40, 4)), 300, "a bogus shuffled frame is refused (or no zstd here)");
+        bad(seg(300, 40, 2, 3, fill_vec(40, 4)), 300, "a shuffled segment of width 3 is refused");
+        bad(seg(300, 40, 1, 4, fill_vec(40, 4)), 300, "a plain zstd segment with a width is refused");
+    }
+    if (!zs) {
+        std::vector<uint8_t> out;
+        bool raw = false;
+        const auto v = fill_vec(100000, 5);
+        check(codec_encode(ChunkCodec::zstd, 1, 4, v.data(), v.size(), out, raw) && raw, "no zstd: encode stores raw");
+        std::vector<CodecSegment> segs{{100000, 4, 0}};
+        bool sh = true;
+        check(segmented_encode(1, segs.data(), 1, v.data(), v.size(), nullptr, out, sh) && !sh && out.size() == v.size() + 12, "no zstd: the container holds raw segments");
+        return;
+    }
+    // zstd: single segment
+    for (uint8_t w : {0, 2, 4}) {
+        g_low_entropy = true;
+        const auto v = fill_vec(200000, 6);
+        g_low_entropy = false;
+        std::vector<uint8_t> enc, back(v.size());
+        bool raw = true;
+        check(codec_encode(ChunkCodec::zstd, 1, w, v.data(), v.size(), enc, raw) && !raw && enc.size() < v.size() * 6 / 10, "zstd encodes compressible bytes");
+        check(codec_decode(ChunkCodec::zstd, w > 1, w, enc.data(), enc.size(), back.data(), back.size()) && back == v, "zstd round trip");
+        std::vector<uint8_t> small(v.size() - 1), big(v.size() + 1);
+        check(!codec_decode(ChunkCodec::zstd, w > 1, w, enc.data(), enc.size(), small.data(), small.size()), "a frame larger than the capacity is refused");
+        check(!codec_decode(ChunkCodec::zstd, w > 1, w, enc.data(), enc.size(), big.data(), big.size()), "a frame smaller than raw_len is refused");
+        auto torn = enc;
+        torn.resize(torn.size() / 2);
+        check(!codec_decode(ChunkCodec::zstd, w > 1, w, torn.data(), torn.size(), back.data(), back.size()), "a torn frame is refused");
+        for (size_t at : {size_t(0), enc.size() / 3, enc.size() - 1}) {
+            auto bad = enc;
+            bad[at] ^= 0x55;
+            (void) codec_decode(ChunkCodec::zstd, w > 1, w, bad.data(), bad.size(), back.data(), back.size());   // (never crashes; the chunk's key check catches a silent change)
+            check(true, "a flipped byte does not crash the decoder");
+        }
+        check(!codec_decode(ChunkCodec::zstd, true, 0, enc.data(), enc.size(), back.data(), back.size()), "shuffled without a width is refused");
+    }
+    {
+        const auto v = fill_vec(200000, 7);   // random
+        std::vector<uint8_t> enc;
+        bool raw = false;
+        check(codec_encode(ChunkCodec::zstd, 1, 0, v.data(), v.size(), enc, raw) && raw, "random bytes: stored as they are");
+    }
+    // shuffling helps f32-like data (constant high bytes) and never hurts the round trip
+    {
+        std::vector<uint8_t> f(400000);
+        for (size_t i = 0; i < f.size(); i += 4) { f[i] = hb(1, i); f[i + 1] = hb(2, i) & 0x0f; f[i + 2] = 0x3f; f[i + 3] = 0x40; }
+        std::vector<uint8_t> a, b, back(f.size());
+        bool raw = false;
+        check(codec_encode(ChunkCodec::zstd, 1, 0, f.data(), f.size(), a, raw) && !raw, "f32-like bytes compress");
+        check(codec_encode(ChunkCodec::zstd, 1, 4, f.data(), f.size(), b, raw) && !raw && b.size() <= a.size(), "and shuffled they do not compress worse");
+        check(codec_decode(ChunkCodec::zstd, true, 4, b.data(), b.size(), back.data(), back.size()) && back == f, "shuffled f32 round trip");
+    }
+    // the container: mixed segments (a small one stays raw, a random one stays raw, the compressible ones are packed)
+    {
+        g_low_entropy = true;
+        auto k = fill_vec(100000, 11), kscale = fill_vec(40000, 12), tiny = fill_vec(5000, 13);
+        g_low_entropy = false;
+        const auto rnd = fill_vec(70000, 14);
+        std::vector<uint8_t> raw_all;
+        for (const auto& p : {std::cref(k), std::cref(tiny), std::cref(kscale), std::cref(rnd)}) raw_all.insert(raw_all.end(), p.get().begin(), p.get().end());
+        std::vector<CodecSegment> segs{{100000, 0, 0}, {5000, 4, 1}, {40000, 2, 2}, {70000, 0, 3}};
+        AdaptiveSkip sk;
+        std::vector<uint8_t> enc, back(raw_all.size());
+        bool sh = false;
+        check(segmented_encode(1, segs.data(), segs.size(), raw_all.data(), raw_all.size(), &sk, enc, sh), "container encodes");
+        check(sh, "a shuffled segment is reported");
+        check(enc.size() < raw_all.size() * 7 / 10, "the container is smaller");
+        check(segmented_decode(enc.data(), enc.size(), back.data(), back.size()) && back == raw_all, "container round trip");
+        // walk the segment headers: modes 1, 0 (too small), 2, 0 (random)
+        std::vector<uint8_t> modes;
+        for (size_t pos = 0; pos < enc.size();) { modes.push_back(enc[pos + 8]); pos += 12 + rd<uint32_t>(enc, pos + 4); }
+        check(modes == std::vector<uint8_t>({1, 0, 2, 0}), "the segments are stored on their own terms");
+        // a lying raw_len: decoding must not write past the destination
+        auto lie = enc;
+        wr<uint32_t>(lie, 0, 1000);
+        std::vector<uint8_t> small(raw_all.size());
+        check(!segmented_decode(lie.data(), lie.size(), small.data(), small.size()), "a lying segment length is refused");
+        // sums that do not match the data
+        std::vector<CodecSegment> wrong{{100, 0, 0}};
+        check(!segmented_encode(1, wrong.data(), 1, raw_all.data(), 99, nullptr, enc, sh), "segments must add up to the length");
+        // without the skip hint, with the hint after incompressible history
+        AdaptiveSkip cold;
+        for (int i = 0; i < 4; ++i) cold.record(3, 1 << 20, 1 << 20);
+        std::vector<CodecSegment> one{{100000, 0, 3}};
+        check(segmented_encode(1, one.data(), 1, k.data(), 100000, &cold, enc, sh) && enc[8] == 0, "a kind that did not pay is stored raw without trying");
+    }
+}
+
+std::vector<uint8_t> chunk_header_reseal(std::vector<uint8_t> f) {
+    wr<uint64_t>(f, 40, session_hash64(f.data(), 40, 0));
+    return f;
+}
+
+void test_codec_chunks() {
+    const bool zs = codec_available(ChunkCodec::zstd);
+    Fx fx("codec");
+    fx.codec = ChunkCodec::zstd;
+    fx.make_pool(true);
+    Fx rawfx("codecraw");
+    g_low_entropy = true;
+    const auto low = fill_vec(3u << 20, 21);
+    g_low_entropy = false;
+    const auto rnd = fill_vec(1u << 20, 22);
+    ChunkRef r, rr;
+    ChunkPutInfo info;
+    std::string err;
+    check(fx.pool->put(ChunkKind::state_slice, low.data(), low.size(), 4, r, info, err), "put compressible");
+    check(rawfx.pool->put(ChunkKind::state_slice, low.data(), low.size(), 4, rr, info, err), "put into the raw pool");
+    check(r.key == rr.key && r.raw_len == rr.raw_len, "the key does not depend on the codec");
+    std::vector<uint8_t> out(low.size());
+    if (zs) {
+        check(r.stored_len < r.raw_len * 6 / 10, "the chunk is stored smaller");
+        check(fs::file_size(fx.pool->path_of(r.key)) == chunk_file_size(r.stored_len), "and its file follows the size formula");
+        ChunkPutInfo i2;
+        ChunkRef r2;
+        check(fx.pool->put(ChunkKind::state_slice, low.data(), low.size(), 4, r2, i2, err) && i2.hit && r2 == r, "a second put is a hit");
+        const auto file = slurp(fx.pool->path_of(r.key));
+        check(file[16] == 2 && (file[17] & 3) == 3, "header: codec 2, shuffled + segmented flags");
+        check(fx.pool->get(ChunkKind::state_slice, r, out.data(), out.size(), err) && out == low, "zstd chunk reads back");
+        // a pool without the codec option reads it too (the codec is in the chunk)
+        Fx other("codecother");
+        fs::remove_all(other.pool_dir);
+        fs::copy(fx.pool_dir, other.pool_dir, fs::copy_options::recursive);
+        other.make_pool(true);
+        std::fill(out.begin(), out.end(), 0);
+        check(other.pool->get(ChunkKind::state_slice, r, out.data(), out.size(), err) && out == low, "a raw-codec pool reads a zstd chunk");
+        // corruption
+        auto flip = [&](size_t at, uint8_t x, bool reseal, const char* label) {
+            auto f = file;
+            f[at] ^= x;
+            if (reseal) f = chunk_header_reseal(f);
+            fs::path p = fx.pool->path_of(r.key);
+            spit(p, f);
+            std::fill(out.begin(), out.end(), 0);
+            check(!fx.pool->get(ChunkKind::state_slice, r, out.data(), out.size(), err), label);
+            spit(p, file);
+        };
+        flip(4096 + 5, 0x40, false, "a flipped payload byte is refused");
+        flip(4096 + 12 + 100, 0x01, false, "a flipped frame byte is refused");
+        flip(4096 + r.stored_len - 1, 0x80, false, "a flipped last byte is refused");
+        flip(17, 2, true, "the segmented flag cleared on a zstd chunk is refused");
+        {   // the shuffled flag is informational (each segment says its own mode): clearing it changes nothing
+            auto f = file;
+            f[17] &= ~1;
+            spit(fx.pool->path_of(r.key), chunk_header_reseal(f));
+            std::fill(out.begin(), out.end(), 0);
+            check(fx.pool->get(ChunkKind::state_slice, r, out.data(), out.size(), err) && out == low, "the shuffled flag is informational");
+            spit(fx.pool->path_of(r.key), file);
+        }
+        flip(16, 0x01, true, "an unknown codec is refused");
+        flip(16, 0x03, true, "lz4 is refused");
+        check(fx.pool->get(ChunkKind::state_slice, r, out.data(), out.size(), err) && out == low, "restored chunk reads");
+        // random bytes stay raw
+        ChunkRef r3;
+        check(fx.pool->put(ChunkKind::kv_slab, rnd.data(), rnd.size(), 0, r3, info, err) && info.codec == ChunkCodec::raw && r3.stored_len == r3.raw_len && !info.shuffled, "incompressible bytes are stored raw");
+    } else {
+        check(r.stored_len == r.raw_len && info.codec == ChunkCodec::raw, "no zstd: the writer emits a raw chunk");
+        check(slurp(fx.pool->path_of(r.key)) == slurp(rawfx.pool->path_of(rr.key)), "byte-identical to the raw pool's");
+    }
+    // a codec-2 chunk made by hand out of raw segments reads in every build; one with a zstd segment is a clean refusal
+    {
+        const auto v = fill_vec(50000, 23);
+        const ChunkKey key = chunk_key(v.data(), v.size());
+        auto mk = [&](const std::vector<uint8_t>& payload, const ChunkKey& k, uint32_t raw_len) {
+            std::vector<uint8_t> f(chunk_file_size((uint32_t) payload.size()), 0);
+            std::memcpy(f.data(), "STRCHNK1", 8);
+            wr<uint32_t>(f, 8, raw_len); wr<uint32_t>(f, 12, (uint32_t) payload.size());
+            f[16] = 2; f[17] = 2;
+            std::memcpy(f.data() + 24, k.b.data(), 16);
+            f = chunk_header_reseal(f);
+            std::memcpy(f.data() + 4096, payload.data(), payload.size());
+            return f;
+        };
+        Fx hx("codechand");
+        ChunkRef ref;
+        ref.key = key; ref.raw_len = (uint32_t) v.size();
+        auto ok_payload = seg((uint32_t) v.size(), (uint32_t) v.size(), 0, 0, v);
+        ref.stored_len = (uint32_t) ok_payload.size();
+        // stored_len must be <= raw_len for a chunk: pad the check by splitting the data in two segments of a tiny header cost
+        // (a container is larger than its raw bytes only when nothing was packed; a real writer would have stored raw)
+        const bool header_ok = ref.stored_len <= ref.raw_len;
+        if (!header_ok) {
+            // an all-raw container is bigger than raw_len: the reader refuses it (stored_len over raw_len)
+            fs::create_directories(fs::path(hx.pool->path_of(key)).parent_path());
+            spit(hx.pool->path_of(key), mk(ok_payload, key, (uint32_t) v.size()));
+            std::string e;
+            check(!hx.pool->get(ChunkKind::kv_slab, ref, out.data(), out.size(), e), "a codec-2 chunk larger than its raw bytes is refused");
+        }
+    }
+}
+
+// the options of a pipeline test: one image big enough for 16 KiB codec segments
+Spec big_spec(bool low) {
+    (void) low;
+    Spec sp;
+    sp.n = 9000;
+    sp.cps = {2500, 6000};
+    sp.live_gdn = (4u << 20) + 4097;
+    sp.cp_gdn = (4u << 20) / 2;
+    return sp;
+}
+
+struct Pw {
+    bool ok = false;
+    std::vector<uint8_t> manifest;
+    W w;
+};
+Pw write_with(Fx& fx, const SavedConversation& img, const char* leaf, int workers, uint32_t T = 2048, ChunkedWriteOptions o = {}) {
+    Pw r;
+    o.workers = workers;
+    r.ok = write_to(fx, fx.path(leaf), img, r.w, T, o);
+    if (r.ok) r.manifest = slurp(fx.path(leaf));
+    return r;
+}
+
+void test_pipeline(ChunkCodec codec) {
+    const bool zs = codec == ChunkCodec::zstd && codec_available(codec);
+    const char* name = zs ? "zstd" : "raw";
+    std::printf("  pipeline, codec %s\n", name);
+    for (bool low : {false, true}) {
+        g_low_entropy = low;
+        const Spec sp = big_spec(low);
+        const SavedConversation img = make_image(sp);
+        g_low_entropy = false;
+        Fx base("pipe-base");
+        base.codec = codec;
+        base.make_pool(true);
+        const Pw one = write_with(base, img, "m.bin", 1);
+        check(one.ok, "workers=1 writes");
+        if (zs && low) check(one.w.stats.new_file_bytes < one.w.stats.raw_bytes * 8 / 10, "zstd: compressible data takes fewer file bytes");
+        if (zs && !low) check(one.w.stats.new_file_bytes > one.w.stats.raw_bytes * 95 / 100, "zstd: random data stays about raw");
+        for (int workers : {2, 3, 4, 8}) {
+            Fx fx("pipe-w");
+            fx.codec = codec;
+            fx.make_pool(true);
+            std::atomic<int> inside{0};
+            std::atomic<bool> overlap{false};
+            uint64_t last = 0, total = 0;
+            bool monotonic = true;
+            ChunkedWriteOptions o;
+            o.progress = [&](uint64_t done, uint64_t all) {
+                if (inside++) overlap = true;
+                if (done < last) monotonic = false;
+                last = done; total = all;
+                --inside;
+            };
+            const Pw p = write_with(fx, img, "m.bin", workers, 2048, o);
+            check(p.ok, "a pipelined write succeeds");
+            check(!overlap && monotonic && last == total && total > 0, "progress: serialized, monotonic, complete");
+            if (!zs) check(p.manifest == one.manifest, "raw: the manifest is byte-identical to the serial one");
+            check(p.w.stats.chunks == one.w.stats.chunks && p.w.stats.raw_bytes == one.w.stats.raw_bytes &&
+                  p.w.stats.misses == one.w.stats.misses && p.w.refs.size() == one.w.refs.size(), "the same chunks");
+            for (size_t i = 0; i < p.w.refs.size(); ++i) check(p.w.refs[i].key == one.w.refs[i].key && p.w.refs[i].raw_len == one.w.refs[i].raw_len, "refs in manifest order");
+            for (int rw : {1, 2, 4}) {
+                SavedConversation back;
+                std::string err;
+                size_t mb = 0;
+                uint64_t rb = 0;
+                ChunkedReadOptions ro;
+                ro.workers = rw;
+                SessionReadLimits lim;
+                std::atomic<int> in2{0};
+                std::atomic<bool> ov2{false};
+                uint64_t lastd = 0;
+                lim.progress = [&](uint64_t d, uint64_t) { if (in2++) ov2 = true; lastd = std::max(lastd, d); --in2; };
+                check(chunked_read(*fx.pool, fx.path("m.bin"), kId, back, mb, rb, err, lim, ro) && same(img, back), "a pipelined read reproduces the image");
+                check(!ov2 && rb == lastd, "read progress is serialized and complete");
+            }
+        }
+        // writes of the same image through sources, pipelined
+        {
+            Fx fx("pipe-src");
+            fx.codec = codec;
+            fx.make_pool(true);
+            const auto srcs = sources_of(img);
+            SavedConversation meta = img;
+            for (auto& k : meta.kv) { k.k = {}; k.v = {}; k.k_scale = {}; k.v_scale = {}; k.pooled = {}; }
+            // (the meta carries no K/V: the sources do)
+            meta.kv.clear();
+            W w;
+            ChunkedWriteOptions o;
+            o.workers = 4;
+            check(write_to(fx, fx.path("s.bin"), meta, w, 2048, o, &srcs), "pipelined write from sources");
+            SavedConversation back;
+            std::string err;
+            check(read_from(fx, fx.path("s.bin"), back, err) && same(img, back), "and it reads back");
+            if (!zs) check(slurp(fx.path("s.bin")) == one.manifest, "sources and image give the same manifest");
+        }
+    }
+    g_low_entropy = false;
+}
+
+void test_pipeline_failures(ChunkCodec codec) {
+    g_low_entropy = true;
+    const SavedConversation img = make_image(big_spec(true));
+    g_low_entropy = false;
+    for (int workers : {1, 2, 4}) {
+        {   // cancel part-way
+            Fx fx("pf-cancel");
+            fx.codec = codec;
+            fx.make_pool(true);
+            std::atomic<int> polls{0};
+            ChunkedWriteOptions o;
+            o.cancel = [&] { return ++polls > 5; };
+            const Pw p = write_with(fx, img, "m.bin", workers, 2048, o);
+            check(!p.ok && p.w.error.find("cancelled") != std::string::npos && p.w.refs.empty(), "cancel under workers gives the write up");
+            check(fx.pool->live_bytes() == 0 && !fs::exists(fx.path("m.bin")), "cancel: every ref is back, no manifest");
+            check(count_prefixed(fx.root, ".tmp-") == 0, "cancel: no temporary chunk file left");
+            // the same pool writes the image afterwards
+            const Pw q = write_with(fx, img, "m.bin", workers);
+            SavedConversation back;
+            std::string err;
+            check(q.ok && read_from(fx, fx.path("m.bin"), back, err) && same(img, back), "and writes it whole afterwards");
+        }
+        {   // a chunk's rename fails (the 4th)
+            Fx fx("pf-rename");
+            fx.codec = codec;
+            fx.make_pool(true);
+            std::atomic<int> n{0};
+            fx.fault = [&](const char* s) { return !std::strcmp(s, "chunk_rename") && ++n == 4 ? EIO : 0; };
+            const Pw p = write_with(fx, img, "m.bin", workers);
+            check(!p.ok && p.w.refs.empty() && fx.pool->live_bytes() == 0, "a failing chunk gives the whole write up and releases the refs");
+            check(count_prefixed(fx.root, ".tmp-") == 0, "no temporary chunk file left after a failed rename");
+        }
+        {   // not enough space for a chunk
+            Fx fx("pf-space");
+            fx.codec = codec;
+            fx.make_pool(true, 600, ~uint64_t(0) >> 2);
+            const Pw p = write_with(fx, img, "m.bin", workers);
+            check(!p.ok && fx.pool->live_bytes() == 0 && p.w.st.error == SessionError::storage, "no space: a storage refusal, refs back");
+        }
+        {   // the K/V source fails at the 3rd slab
+            Fx fx("pf-src");
+            fx.codec = codec;
+            fx.make_pool(true);
+            auto srcs = sources_of(img);
+            std::atomic<int> reads{0};
+            for (auto& s : srcs) {
+                auto inner = s.read;
+                s.read = [&reads, inner](size_t part, size_t off, void* dst, size_t n) { return ++reads <= 40 ? inner(part, off, dst, n) : false; };
+                s.error = [] { return std::string("device gone"); };
+            }
+            SavedConversation meta = img;
+            meta.kv.clear();
+            W w;
+            ChunkedWriteOptions o;
+            o.workers = workers;
+            check(!write_to(fx, fx.path("m.bin"), meta, w, 2048, o, &srcs) && w.error.find("device gone") != std::string::npos, "a failing source gives the write up");
+            check(fx.pool->live_bytes() == 0 && w.refs.empty(), "and the refs are back");
+        }
+    }
+    {   // a bad chunk in the middle of a pipelined read: refused, the output untouched
+        Fx fx("pf-read");
+        fx.codec = codec;
+        fx.make_pool(true);
+        const Pw p = write_with(fx, img, "m.bin", 4);
+        check(p.ok, "write for the read failure");
+        const auto victim = p.w.refs[p.w.refs.size() / 2];
+        auto f = slurp(fx.pool->path_of(victim.key));
+        f[4096 + victim.stored_len / 2] ^= 0x10;
+        spit(fx.pool->path_of(victim.key), f);
+        for (int rw : {1, 4}) {
+            SavedConversation back;
+            back.live.used = 77;
+            std::string err;
+            size_t mb = 0;
+            uint64_t rb = 0;
+            ChunkedReadOptions ro;
+            ro.workers = rw;
+            SessionStatus st;
+            check(!chunked_read(*fx.pool, fx.path("m.bin"), kId, back, mb, rb, err, {}, ro, &st) && !err.empty() && back.live.used == 77, "a corrupt chunk fails a pipelined read and leaves the output alone");
+        }
+    }
+    g_low_entropy = false;
+}
+
+void test_pipeline_concurrent_writers(ChunkCodec codec) {
+    // four threads write overlapping conversations (and read each other's) through one pool, each pipelined
+    Fx fx("pc");
+    fx.codec = codec;
+    fx.make_pool(true);
+    std::vector<SavedConversation> imgs;
+    g_low_entropy = true;
+    for (int i = 0; i < 4; ++i) {
+        Spec sp;
+        sp.n = 3000 + 700 * i;
+        sp.cps = {800, 1500};
+        sp.live_gdn = (4u << 20) + 17;
+        imgs.push_back(make_image(sp));
+    }
+    g_low_entropy = false;
+    std::atomic<int> bad{0};
+    std::vector<std::thread> th;
+    for (int t = 0; t < 4; ++t)
+        th.emplace_back([&, t] {
+            for (int round = 0; round < 3; ++round) {
+                W w;
+                ChunkedWriteOptions o;
+                o.workers = 2;
+                o.chunk_tokens = 1024;
+                const std::string path = fx.path("c" + std::to_string(t) + ".bin");
+                if (!chunked_write(*fx.pool, path, imgs[(size_t) t], nullptr, kId, o, w.refs, w.stats, w.error, &w.st)) { ++bad; continue; }
+                SavedConversation back;
+                size_t mb = 0;
+                uint64_t rb = 0;
+                std::string err;
+                ChunkedReadOptions ro;
+                ro.workers = 2;
+                if (!chunked_read(*fx.pool, path, kId, back, mb, rb, err, {}, ro) || !same(imgs[(size_t) t], back)) ++bad;
+                fx.pool->unref(w.refs.data(), w.refs.size());
+            }
+        });
+    for (auto& t : th) t.join();
+    check(bad == 0, "concurrent pipelined writers and readers on one pool");
+    check(fx.pool->live_bytes() == 0, "all refs given back");
+}
+
+void test_codec_suite() {
+    test_pipeline(ChunkCodec::raw);
+    test_pipeline_failures(ChunkCodec::raw);
+    test_pipeline_concurrent_writers(ChunkCodec::raw);
+    test_pipeline(ChunkCodec::zstd);   // without zstd in the build the writer emits raw: the same checks hold
+    test_pipeline_failures(ChunkCodec::zstd);
+    test_pipeline_concurrent_writers(ChunkCodec::zstd);
+}
+
+
+// the review round: corrupt chunks are repaired, durable hits are made durable, the peak estimate, the shared stamp
+void test_review_fixes() {
+    std::string err;
+    ChunkPutInfo info;
+    {   // a chunk whose payload rotted is moved aside by the read that finds it, and the next put writes a fresh one
+        Fx fx("rot");
+        ChunkPool& pool = *fx.pool;
+        std::vector<uint8_t> raw = fill_vec(9000, 21);
+        ChunkRef r;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "rot: put");
+        auto f = slurp(pool.path_of(r.key));
+        f[kChunkAlign + 10] ^= 0x40;   // the payload, past the header block a hit looks at
+        spit(pool.path_of(r.key), f);
+        std::vector<uint8_t> back(raw.size());
+        check(!pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err) && err.find("content hash mismatch") != std::string::npos,
+              "rot: the read fails on the hash");
+        check(!fs::exists(pool.path_of(r.key)) && count_prefixed(fx.pool_dir / r.key.hex().substr(0, 2), ".tmp-bad-") == 1,
+              "rot: the bad file is moved aside (a leftover the next open sweeps)");
+        check(!pool.exists(r), "rot: the reader's exists() check now misses, so a manifest naming it is not trusted");
+        ChunkRef again;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, again, info, err) && !info.hit && again == r,
+              "rot: a put of the same bytes writes a fresh chunk, not a hit on the bad one");
+        check(pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err) && back == raw, "rot: and it reads back");
+        check(pool.refs_of(r.key) == 2, "rot: the references the manifests hold are kept (one more for the new writer)");
+        // a ghost that rots goes from the index too
+        std::vector<uint8_t> raw2 = fill_vec(5000, 22);
+        ChunkRef r2;
+        check(pool.put(ChunkKind::kv_slab, raw2.data(), raw2.size(), 0, r2, info, err), "rot: put 2");
+        pool.unref(&r2, 1);
+        auto f2 = slurp(pool.path_of(r2.key));
+        f2[kChunkAlign + 3] ^= 1;
+        spit(pool.path_of(r2.key), f2);
+        const size_t n = pool.count();
+        std::vector<uint8_t> back2(raw2.size());
+        check(!pool.get(ChunkKind::kv_slab, r2, back2.data(), back2.size(), err) && pool.count() == n - 1, "rot: an unreferenced bad chunk leaves the index");
+    }
+    {   // durable: a hit on a chunk a non-durable write made flushes it and its folder; a failed folder sync is not forgotten
+        Fx fx("durable");
+        ChunkPool& pool = *fx.pool;
+        std::vector<uint8_t> raw = fill_vec(7000, 31);
+        ChunkRef r;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err, false), "durable: a non-durable put");
+        auto count = [&](const char* step) { std::lock_guard<std::mutex> g(fx.steps_mu); return (int) std::count(fx.steps.begin(), fx.steps.end(), std::string(step)); };
+        check(pool.sync_touched_shards(err), "durable: (the pool folder the first chunk created is flushed)");
+        const int base = count("shard_sync");
+        const int flushes = count("chunk_flush");
+        ChunkRef r2;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r2, info, err, true) && info.hit, "durable: a durable put hits it");
+        check(count("chunk_flush") == flushes + 1, "durable: the hit chunk is flushed (fdatasync)");
+        check(pool.sync_touched_shards(err) && count("shard_sync") == base + 1, "durable: and its shard folder is queued for the sync");
+        // a failed folder sync: the same shards are flushed again by the retry
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r2, info, err, true) && info.hit, "durable: hit again");
+        fx.fault = [](const char* s) { return !std::strcmp(s, "shard_sync") ? EIO : 0; };
+        const int syncs = count("shard_sync");
+        check(!pool.sync_touched_shards(err) && count("shard_sync") == syncs + 1, "durable: the sync fails");
+        fx.fault = nullptr;
+        check(pool.sync_touched_shards(err) && count("shard_sync") == syncs + 2, "durable: the retry flushes the shard again (the failed one is not forgotten)");
+        check(pool.sync_touched_shards(err) && count("shard_sync") == syncs + 2, "durable: and then there is nothing left");
+        // a failed flush of a hit chunk fails the put and leaves the (valid) file alone
+        fx.fault = [](const char* s) { return !std::strcmp(s, "chunk_flush") ? EIO : 0; };
+        check(!pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r2, info, err, true) && info.error_kind == SessionError::io && !info.hit,
+              "durable: a failed flush of a hit chunk fails the put");
+        fx.fault = nullptr;
+        std::vector<uint8_t> back(raw.size());
+        check(pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err) && back == raw, "durable: the chunk is intact");
+        // two durable writers at once: the second does not return while the first still flushes the folders it took
+        std::atomic<int> started{0};
+        fx.fault = [&](const char* s) {
+            if (!std::strcmp(s, "shard_sync")) { ++started; std::this_thread::sleep_for(std::chrono::milliseconds(150)); }
+            return 0;
+        };
+        std::vector<uint8_t> raw_b = fill_vec(7001, 32);
+        ChunkRef rb;
+        check(pool.put(ChunkKind::kv_slab, raw_b.data(), raw_b.size(), 0, rb, info, err, true), "durable: writer B's chunk (its folder is queued)");
+        std::thread ta([&] { std::string e2; pool.sync_touched_shards(e2); });   // writer A's sync takes B's folder too
+        while (started.load() == 0) std::this_thread::yield();
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string e3;
+        check(pool.sync_touched_shards(e3), "durable: B's sync succeeds");
+        const double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ta.join();
+        fx.fault = nullptr;
+        check(waited > 60, "durable: B's sync waited for A's flush to finish instead of returning on an emptied set");
+    }
+    {   // a look at an existing chunk that fails (resources, I/O) says nothing about the file: the put fails, the file stays
+        Fx fx("look");
+        ChunkPool& pool = *fx.pool;
+        std::vector<uint8_t> raw = fill_vec(8000, 41);
+        ChunkRef r;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "look: put");
+        fx.fault = [](const char* s) { return !std::strcmp(s, "chunk_validate") ? EMFILE : 0; };
+        ChunkRef r2;
+        check(!pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r2, info, err) && !info.hit && info.error_kind != SessionError::none,
+              "look: a failed look fails the put");
+        fx.fault = nullptr;
+        check(fs::exists(pool.path_of(r.key)) && pool.refs_of(r.key) == 1, "look: the chunk file is not touched, its reference is unchanged");
+        std::vector<uint8_t> back(raw.size());
+        check(pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err) && back == raw, "look: and it still reads");
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r2, info, err) && info.hit, "look: the next put hits it");
+    }
+    {   // the RAM preflight counts the manifest's largest chunk and three buffers per worker
+        const uint64_t raw_total = 1ull << 30;
+        const uint64_t big = 48ull << 20;
+        const uint64_t need = chunked_read_peak_bytes(raw_total, 8, 512, big);
+        check(need >= raw_total + 8 * 3 * big, "peak: three buffers of the largest chunk for each of 8 workers");
+        check(chunked_read_peak_bytes(raw_total, 8, 512, 1 << 20) < need, "peak: a smaller chunk needs less");
+        check(chunked_read_peak_bytes(raw_total, 1, 512, big) < need && chunked_read_peak_bytes(raw_total, 1, 64) > raw_total, "peak: per worker, and the guess without a manifest");
+        // a read of an image whose chunks are large is asked for more than the guess from chunk_tokens (small tokens, big rows)
+        Fx fx("peak");
+        Spec sp;
+        sp.n = 200; sp.cps = {};
+        SavedConversation img = make_image(sp);
+        W w;
+        check(write_to(fx, fx.path("p.bin"), img, w, 64), "peak: written");
+        uint64_t asked_max = 0;
+        SessionReadLimits lim;
+        lim.admit = [&](uint64_t n, std::string&) { asked_max = std::max(asked_max, n); return true; };
+        SavedConversation back;
+        std::string e;
+        check(read_from(fx, fx.path("p.bin"), back, e, lim), "peak: read");
+        uint64_t max_raw = 0;
+        for (const auto& r : w.refs) max_raw = std::max<uint64_t>(max_raw, r.raw_len);
+        const uint64_t rt = rd<uint64_t>(slurp(fx.path("p.bin")), 48);
+        check(asked_max >= std::max(chunked_read_peak_bytes(rt, 1, 64, max_raw), chunked_read_peak_bytes(rt, 1, 64)),
+              "peak: the read is asked for the manifest's largest chunk when that is more than the guess");
+    }
+    {   // shared: a chunk another engine wrote is adopted with the file's own age, so the first hit touches it
+        Fx fx("adopt", true, 600);
+        ChunkPoolOptions o;
+        o.dir = fx.pool_dir.string();
+        o.grace_s = 600;
+        o.clock_s = [&fx] { return fx.clock; };
+        ChunkPool b(o);   // engine B: opened before A wrote
+        check(b.open(err), "adopt: B opens");
+        std::vector<uint8_t> raw = fill_vec(4000, 51);
+        ChunkRef r;
+        check(fx.pool->put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "adopt: A writes");
+        const int64_t written = fx.clock;
+        fx.clock += 5000;   // hours later by the grace's measure
+        b.ref(&r, 1);       // B finds it through a manifest
+        ChunkRef again;
+        check(b.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, again, info, err) && info.hit, "adopt: B hits it");
+        struct stat st {};
+        check(::stat(b.path_of(r.key).c_str(), &st) == 0 && (int64_t) st.st_mtime == fx.clock && (int64_t) st.st_mtime > written,
+              "adopt: the hit touched the file (its age was the file's, not the moment of adoption)");
+    }
+    {   // the shared sweep re-checks the size on the disk: a file that is not the one that was indexed stays
+        Fx fx("sweepsize", true, 600);
+        ChunkPool& pool = *fx.pool;
+        std::vector<uint8_t> raw = fill_vec(5000, 61);
+        ChunkRef r;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "sweep size: put");
+        pool.unref(&r, 1);
+        fx.clock += 5000;
+        std::vector<uint8_t> other(chunk_file_size(5000) + 2 * kChunkAlign, 7);   // another size under the name
+        spit(pool.path_of(r.key), other);
+        struct timespec ts[2] = {{0, UTIME_OMIT}, {(time_t) (fx.clock - 3000), 0}};
+        ::utimensat(AT_FDCWD, pool.path_of(r.key).c_str(), ts, 0);
+        std::set<ChunkKey> none;
+        check(pool.sweep(true, false, &none) == 0 && fs::exists(pool.path_of(r.key)), "sweep size: an old unnamed file of another size is not unlinked");
+    }
+    {   // before_publish: a chunk gone before the manifest fails the write and publishes nothing
+        Fx fx("publish");
+        Spec sp;
+        sp.n = 100;
+        SavedConversation img = make_image(sp);
+        ChunkedWriteOptions o;
+        o.before_publish = [](const std::vector<ChunkRef>&, std::string& why) { why = "chunk gone"; return false; };
+        W w;
+        check(!write_to(fx, fx.path("bp.bin"), img, w, 64, o) && w.error.find("chunk gone") != std::string::npos && !fs::exists(fx.path("bp.bin")),
+              "publish: a refusing before_publish fails the write and leaves no manifest");
+        size_t seen = 0;
+        o.before_publish = [&](const std::vector<ChunkRef>& refs, std::string&) { seen = refs.size(); return true; };
+        W w2;
+        check(write_to(fx, fx.path("bp.bin"), img, w2, 64, o) && seen == w2.refs.size() && seen > 0 && fs::exists(fx.path("bp.bin")),
+              "publish: asked with every reference, and an accepting one publishes");
+    }
+    {   // the digest's tail (bytes after the last full 8 and 32): golden keys, and little-endian byte order
+        const char* gp = std::getenv("STRATA_CHUNKS_GOLDEN_PRINT");
+        struct G { size_t n; const char* hex; };
+        const G golden[] = {
+            {1, "537dd636a33bbd3c117409b501406729"}, {7, "99250e5e33ed5dae22dcb7afbf810509"},
+            {8, "1b09f5a555835a2afecfed2fbc0c3689"}, {9, "21e516b4f647c8a8dce83bbb86b4c257"},
+            {31, "d74fc5361be9a3541cf44e96376d2be5"}, {33, "647685ed21fdc96249878015b4ce4d79"},
+            {39, "fcb140fd6c81c521b72711d4a75657fa"}, {1001, "12069432236b6f96c2386f69de634858"}};
+        for (const auto& g : golden) {
+            std::vector<uint8_t> d(g.n);
+            for (size_t i = 0; i < g.n; ++i) d[i] = (uint8_t) (i * 31 + 7);
+            if (gp) std::printf("golden tail %zu %s\n", g.n, chunk_key(d.data(), d.size()).hex().c_str());
+            else check(chunk_key(d.data(), d.size()).hex() == g.hex, "digest128: golden key of a patterned buffer with a tail");
+        }
+        SessionHasher h(0);
+        const uint8_t one[3] = {1, 2, 3};
+        h.update(one, 3);
+        const auto dg = h.digest128();
+        uint64_t lo = 0;
+        for (int i = 7; i >= 0; --i) lo = lo << 8 | dg[(size_t) i];
+        check(lo == h.digest(), "digest128: the low half is digest() as a little-endian number");
+    }
+}
+
+// the review round 2: the read's worker count, a decoder that cannot be made, a replaced chunk is not quarantined
+void test_review_fixes2() {
+    std::string err;
+    ChunkPutInfo info;
+    {   // the calling thread works beside the workers: one more set of buffers is live than there are workers
+        const uint64_t raw_total = 1ull << 30, big = 48ull << 20;
+        check(chunked_read_peak_bytes(raw_total, 2, 512, big) >= raw_total + 3 * 3 * big, "peak: workers + the calling thread hold buffers");
+        check(chunked_read_peak_bytes(raw_total, 8, 512, big) >= raw_total + 9 * 3 * big, "peak: 8 workers + the caller");
+        check(chunked_read_peak_bytes(raw_total, 1, 512, big) < raw_total + 2 * 3 * big, "peak: one worker is the caller alone");
+        check(chunked_read_peak_bytes(raw_total, 2, 512, big) > chunked_read_peak_bytes(raw_total, 1, 512, big), "peak: two workers need more than one");
+    }
+    {   // a chunk that is replaced between the reader's stat and its quarantine is the writer's: it stays
+        Fx fx("quar");
+        ChunkPool& pool = *fx.pool;
+        std::vector<uint8_t> raw = fill_vec(9000, 31);
+        ChunkRef r;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "quarantine race: put");
+        const auto good = slurp(pool.path_of(r.key));
+        auto bad = good;
+        bad[kChunkAlign + 10] ^= 0x40;
+        spit(pool.path_of(r.key), bad);
+        fx.fault = [&](const char* step) {
+            if (std::strcmp(step, "chunk_quarantine") == 0) {   // a concurrent writer publishes a fresh file (a new inode)
+                const std::string tmp = pool.path_of(r.key) + ".replacement";
+                spit(tmp, good);
+                fs::rename(tmp, pool.path_of(r.key));
+            }
+            return 0;
+        };
+        std::vector<uint8_t> back(raw.size());
+        check(!pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err), "quarantine race: the read of the rotten file fails");
+        fx.fault = nullptr;
+        check(fs::exists(pool.path_of(r.key)) && count_prefixed(fx.pool_dir / r.key.hex().substr(0, 2), ".tmp-bad-") == 0,
+              "quarantine race: the replacement is not moved aside");
+        check(pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err) && back == raw, "quarantine race: and it reads");
+    }
+#ifdef STRATA_DISK_ZSTD
+    {   // a decoder that cannot get its context is not a corrupt chunk: the file stays
+        Fx fx("noctx");
+        fx.codec = ChunkCodec::zstd;
+        fx.make_pool(true);
+        ChunkPool& pool = *fx.pool;
+        std::vector<uint8_t> raw(200000);
+        for (size_t i = 0; i < raw.size(); ++i) raw[i] = uint8_t((i / 64) % 7);   // compresses well: stored as zstd
+        ChunkRef r;
+        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err) && r.stored_len < r.raw_len, "no decoder context: a zstd chunk");
+        std::vector<uint8_t> back(raw.size());
+        SessionError kind = SessionError::none;
+        codec_test_fail_decoder_context(true);
+        const bool failed = !pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err, &kind);
+        codec_test_fail_decoder_context(false);
+        check(failed && kind == SessionError::memory, "no decoder context: the read fails as a memory failure");
+        check(fs::exists(pool.path_of(r.key)) && count_prefixed(fx.pool_dir / r.key.hex().substr(0, 2), ".tmp-bad-") == 0,
+              "no decoder context: the chunk is not quarantined");
+        check(pool.get(ChunkKind::kv_slab, r, back.data(), back.size(), err) && back == raw, "no decoder context: it reads once the decoder works");
+        bool res = false;
+        std::vector<uint8_t> junk(64, 0xee);
+        check(!segmented_decode(junk.data(), junk.size(), back.data(), back.size(), &res) && !res, "no decoder context: a bad stream is not a resource failure");
+    }
+#endif
+}
+
 int main() {
     struct Cleanup {
         ~Cleanup() {
@@ -1299,6 +2086,8 @@ int main() {
     test_chunk_corruption();
     test_pool_lifecycle();
     test_failures();
+    test_review_fixes();
+    test_review_fixes2();
     test_concurrent_put();
     test_round_trip_geometry();
     test_padding_and_spare();
@@ -1308,6 +2097,10 @@ int main() {
     test_manifest_corruption();
     test_limits();
     test_write_failures();
+    test_shuffle_and_skip();
+    test_codec_units();
+    test_codec_chunks();
+    test_codec_suite();
     std::printf("conversation_chunks_test: %d checks passed\n", checks);
     return 0;
 }

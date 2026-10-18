@@ -1,0 +1,13 @@
+libzstd.so.1: Zstandard, the compression library of the chunked disk tier's codec
+
+This engine package carries an unmodified copy of libzstd.so.1 from the build machine. The engine links it when it is built with
+STRATA_DISK_ZSTD (the zstd codec of --conversation-disk-chunked, src/core/conversation_codec.cpp), and some Linux systems
+(containers, minimal installs) do not have it.
+
+License: zstd is dual-licensed, BSD-3-Clause or GPL-2.0-only, at the recipient's choice; this package uses it under BSD-3-Clause
+(SPDX: BSD-3-Clause OR GPL-2.0-only).
+  BSD-3-Clause:           https://github.com/facebook/zstd/blob/dev/LICENSE
+Copyright: Meta Platforms, Inc. and affiliates.
+
+Source code: https://github.com/facebook/zstd. The exact source of this copy is the source package of the distribution package named
+below (for Debian and Ubuntu: `apt-get source libzstd`).

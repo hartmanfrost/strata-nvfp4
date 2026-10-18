@@ -10,6 +10,10 @@ gguf-py\ at commit 3cf03257f219afbe7334045ff7c6a06ac68c627d)
   https://github.com/ggml-org/llama.cpp - MIT License, Copyright (c) 2023-2026 The ggml authors.
   See third_party\llama.cpp\LICENSE.
 
+zstd (optional codec of the chunked disk tier, linked only into an engine built with STRATA_DISK_ZSTD, e.g. the
+Docker image; not part of a bundle whose engine was built without it)
+  https://github.com/facebook/zstd - BSD License (BSD-3-Clause), Copyright (c) Meta Platforms, Inc. and affiliates.
+
 NVIDIA CUDA runtime (statically linked) and cuBLAS (engine\cublas64_13.dll, engine\cublasLt64_13.dll), CUDA 13.3
   Redistributed unmodified under the NVIDIA CUDA Toolkit End User License Agreement, which lists these libraries
   as redistributable: https://docs.nvidia.com/cuda/eula/

@@ -3,6 +3,8 @@
 // "STRSESS\x02") plus content-addressed CHUNKS in a pool folder shared by every conversation of one identity:
 //   <dir>/<xx>/<key32hex>.chk      xx = the key's first byte; 4096-byte header block, payload at 4096, size rounded
 //                                  up to 4096 (O_DIRECT-aligned); key = SessionHasher::digest128 of the RAW bytes
+// A zstd chunk's payload is a container of per-part segments (conversation_codec.hpp: raw or zstd, byte-shuffled where
+// the element width says so); raw is the default.
 // A K/V slab (T tokens of every K/V layer) and a 4 MiB slice of a checkpoint's running state are chunks; an image that
 // continues a conversation re-uses every chunk whose bytes did not change.  Chunks are immutable and published by a
 // no-replace rename, so writers need no lock; whether a chunk is still wanted is the tier's reference count (a view
@@ -89,6 +91,7 @@ struct ChunkPutInfo {
     ChunkCodec codec = ChunkCodec::raw;
     bool shuffled = false;
     uint64_t new_file_bytes = 0;        // file bytes this call wrote
+    double encode_ms = 0;               // time in the codec
     bool direct_io = false;             // the write went through O_DIRECT
     SessionError error_kind = SessionError::none;   // after a failure
 };
@@ -104,8 +107,11 @@ public:
     bool open(std::string& error);
     // Thread-safe.  The chunk is referenced (+1) for the caller on return; a writer that fails unref()s its whole list.
     // `buf` holds the raw bytes at payload().
+    // `segments` (optional): how the raw bytes split for the codec (lengths add up to raw_len), else one segment of
+    // `shuffle_width`.
     bool put_buffer(ChunkKind, ChunkBuffer& buf, size_t raw_len, uint8_t shuffle_width, ChunkRef& out,
-                    ChunkPutInfo& info, std::string& error, bool durable = false);
+                    ChunkPutInfo& info, std::string& error, bool durable = false,
+                    const std::vector<CodecSegment>* segments = nullptr);
     // The same from raw bytes elsewhere (one copy into a staging buffer).
     bool put(ChunkKind, const void* raw, size_t raw_len, uint8_t shuffle_width, ChunkRef& out, ChunkPutInfo& info,
              std::string& error, bool durable = false);
@@ -139,8 +145,9 @@ struct ChunkedWriteOptions {
     uint32_t chunk_tokens = 512;        // multiple of 4, 64..4096
     bool durable = false;
     uint64_t min_free_bytes = 0;        // (the pool's own option decides the per-chunk preflight; reserved)
-    int workers = 1;
-    std::function<bool()> cancel;       // asked before every chunk: true gives the write up (error "cancelled")
+    int workers = 1;                    // 1: everything on the calling thread; N: N threads hash, encode and write (1..8)
+    bool low_priority = true;           // the worker threads run at nice +5 (Linux)
+    std::function<bool()> cancel;       // asked before every chunk (with workers, from the worker threads too, never two calls at once): true gives the write up (error "cancelled")
     SessionProgress progress;           // (raw bytes done, raw bytes of the image) after every chunk
     SessionPhase phase;                 // "flush" and "publish" before each starts
     // asked after the last chunk and before the manifest is published (false + why: the write is given up); the

@@ -30,6 +30,8 @@ namespace {
 std::vector<std::string> lines;   // the tier's diagnostic lines
 std::mutex lines_m;
 int checks = 0;
+ChunkCodec g_codec = ChunkCodec::raw;   // the chunked run's codec and pipeline width (the third pass: zstd, 4 workers)
+int g_workers = 1;
 bool g_chunked = false;   // the suite runs twice: the one-file format (v1) and the chunked one (v2)
 void check(bool ok, const char* label) {
     ++checks;
@@ -41,11 +43,17 @@ void check(bool ok, const char* label) {
     }
 }
 
+bool g_random_fill = false;   // the codec pass: bytes a codec cannot shrink, so the byte counts the tests rely on hold
+uint8_t mixed(uint64_t i, uint8_t seed) {
+    uint64_t x = (i + 1) * 0x9E3779B97F4A7C15ull ^ (uint64_t(seed) * 0xD6E8FEB86659FD93ull);
+    x ^= x >> 32; x *= 0xD6E8FEB86659FD93ull; x ^= x >> 32;
+    return uint8_t(x);
+}
 ConversationBuffer pattern(size_t n, uint8_t seed) {
     ConversationBuffer b;
     b.resize(n);
     b.visit(0, n, [&](uint8_t* p, size_t c, size_t at) {
-        for (size_t i = 0; i < c; ++i) p[i] = uint8_t((at + i) * 131u + seed);
+        for (size_t i = 0; i < c; ++i) p[i] = g_random_fill ? mixed(at + i, seed) : uint8_t((at + i) * 131u + seed);
         return true;
     });
     return b;
@@ -53,7 +61,7 @@ ConversationBuffer pattern(size_t n, uint8_t seed) {
 
 std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
     std::vector<uint8_t> v(n);
-    for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
+    for (size_t i = 0; i < n; ++i) v[i] = g_random_fill ? mixed(i, seed) : uint8_t(i * 7u + seed);
     return v;
 }
 
@@ -149,6 +157,8 @@ ConversationDiskOptions opts(const fs::path& dir, uint64_t budget, int64_t ttl_s
     o.budget_bytes = budget;
     o.ttl_s = ttl_s;
     o.chunked = g_chunked;
+    o.codec = g_codec;
+    o.io_workers = g_workers;
     o.log = [](const std::string& l) { std::lock_guard<std::mutex> g(lines_m); lines.push_back(l); };
     return o;
 }
@@ -721,7 +731,7 @@ void chunked_suite(const fs::path& dir) {
         std::vector<fs::path> ys;
         for (const auto& f : fs::directory_iterator(dir)) {
             const std::string name = f.path().filename().string();
-            if (name.rfind(ConversationDiskTier::file_prefix(), 0) == 0 && name.find("-2") != std::string::npos) ys.push_back(f.path());
+            if (name.rfind(ConversationDiskTier::file_prefix(), 0) == 0 && (name.find("-2-0.bin") != std::string::npos || name.find("-2.idx") != std::string::npos)) ys.push_back(f.path());
         }
         check(ys.size() == 2, "gc: Y's index and manifest found");
         for (const auto& f : ys) fs::remove(f);
@@ -835,7 +845,8 @@ void chunked_suite(const fs::path& dir) {
               e == "cancelled" && tier.size() == 0 && tier_files(dir) == 0,
               "fail: cancelled after two chunks: no manifest, no entry");
         const size_t orphans = chunk_files(dir);
-        check(orphans == 2 && tier.pool_chunks() == 2, "fail: the two chunks stay as ghosts");
+        // (with workers, up to that many more chunks were in flight when the cancel came)
+        check((g_workers == 1 ? orphans == 2 : orphans <= 2 + (size_t) g_workers) && tier.pool_chunks() == orphans, "fail: the chunks done stay as ghosts");
         c.advance(11);
         tier.expire();
         check(chunk_files(dir) == 0, "fail: the orphans are swept after the grace");
@@ -916,11 +927,50 @@ void chunked_suite(const fs::path& dir) {
             check(m2.tokens == 300 && t.take(m2.id, m2.tokens, back, e) && same(back, image(300, 96, 6000)), "mixed: the v2 entry reads");
         }
     }
+
+    {   // 10. codec: a compressible dialog takes far fewer file bytes with zstd and reads back exactly (3 workers)
+        const bool saved = g_random_fill;
+        g_random_fill = false;
+        auto o = opts(dir, GiB, 1800);
+        o.codec = ChunkCodec::zstd;
+        o.codec_level = 3;
+        o.io_workers = 3;
+        ConversationDiskTier t(o);
+        check(t.open(e), "codec: open");
+        check(t.write_now(image(400, 97), nullptr, {}, *std::make_unique<uint64_t>(), e), "codec: written");
+        const auto st = t.stats();
+        if (codec_available(ChunkCodec::zstd))
+            check(st.bytes_written < (8u << 20) && logged("zstd") , "codec: far fewer file bytes than the 17 MiB held, logged");
+        else
+            check(st.bytes_written > (16u << 20), "codec: no zstd in this build: stored raw");
+        SavedConversation back;
+        auto m = t.best(prompt_of(450), {}, false);
+        check(m.tokens == 400 && t.take(m.id, m.tokens, back, e) && same(back, image(400, 97)), "codec: reads back exactly");
+        g_random_fill = saved;
+    }
 }
 }  // namespace
 
+void test_parse_codec() {
+    ChunkCodec c = ChunkCodec::lz4;
+    int lv = 0;
+    std::string why;
+    check(conversation_disk_parse_codec("raw", c, lv, why) && c == ChunkCodec::raw, "codec flag: raw");
+    check(conversation_disk_parse_codec("zstd", c, lv, why) && c == ChunkCodec::zstd && lv == 1, "codec flag: zstd is level 1");
+    check(conversation_disk_parse_codec("zstd:19", c, lv, why) && c == ChunkCodec::zstd && lv == 19, "codec flag: zstd:19");
+    check(conversation_disk_parse_codec("zstd:3", c, lv, why) && lv == 3, "codec flag: zstd:3");
+    for (const char* bad : {"", "lz4", "zstd:", "zstd:0", "zstd:20", "zstd:-1", "zstd:x", "zstd:100", "zstd1", "RAW", "raw:1"})
+        check(!conversation_disk_parse_codec(bad, c, lv, why) && !why.empty(), "codec flag: refused");
+}
+
 int main() {
+    test_parse_codec();
     suite(false);
+    suite(true);
+    g_codec = ChunkCodec::zstd;   // (a build without zstd stores raw: the pass is then the pipeline alone)
+    g_workers = 4;
+    g_random_fill = true;
+    std::printf("conversation_disk_test: codec zstd (%s in this build), 4 workers\n", codec_available(ChunkCodec::zstd) ? "available" : "not available");
     suite(true);
     std::printf("conversation_disk_test: %d checks passed\n", checks);
     return 0;

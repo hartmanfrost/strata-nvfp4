@@ -52,7 +52,8 @@ struct ConversationDiskOptions {
     bool chunked = false;
     uint32_t chunk_tokens = 512;     ///< chunked: tokens of K/V per slab (a multiple of 4, 64..4096)
     ChunkCodec codec = ChunkCodec::raw;   ///< chunked: how chunks are stored (zstd falls back to raw when not built in)
-    int io_workers = 2;              ///< chunked: threads of the chunk pipeline
+    int codec_level = 1;             ///< chunked: the zstd level
+    int io_workers = 2;              ///< chunked: threads of the chunk pipeline (hash, codec, write; parallel decode on read)
     /// chunked, tests: seconds since the epoch for the chunks' grace periods (default: the system clock)
     std::function<int64_t()> wall_clock_s;
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
@@ -77,6 +78,10 @@ struct ConversationDiskStats {
     uint64_t chunks_swept = 0, swept_bytes = 0;                    ///< unreferenced chunks deleted
     bool direct_io = false;                                        ///< the last chunk write used O_DIRECT
 };
+
+/// --conversation-disk-codec: "raw" or "zstd" / "zstd:LEVEL" (1..19; plain "zstd" is level 1).  False + `error` otherwise.
+/// A zstd asked for in a build without it is accepted (the tier then stores raw and says so in its start line).
+bool conversation_disk_parse_codec(const std::string& text, ChunkCodec& codec, int& level, std::string& error);
 
 class ConversationDiskTier {
 public:

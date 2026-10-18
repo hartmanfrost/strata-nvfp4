@@ -16,7 +16,8 @@ Distribution libraries (libc, libm, libstdc++, ...) are not copied: they are lis
 (libcuda.so.1, libnvidia-*, libze_intel_gpu, libOpenCL ICDs) are never bundled: they belong to the driver.
 A distribution library that is not on every system is copied from the build machine all the same (BUNDLE_FROM_SYSTEM, more
 with --bundle-system): libatomic.so.1, which TheRock's librocm_sysdeps_numa.so.1 needs; a container with no libatomic1 package
-could not start the AMD engine (boxia, 2026-11-15). Its notice goes into licenses/ (packaging/notices/).
+could not start the AMD engine (boxia, 2026-11-15); libzstd.so.1, which an engine built with STRATA_DISK_ZSTD links (the
+chunked disk tier's codec). Their notices go into licenses/ (packaging/notices/).
 Nothing is downloaded; this only reads files on the build machine.
 """
 
@@ -48,7 +49,7 @@ DRIVER_PATTERNS = ("libcuda.so*", "libnvidia-*", "libnvcuvid*", "libze_intel_gpu
 LDD_LINE = re.compile(r"^\s*(\S+)\s+=>\s+(\S+)\s+\(0x")
 #: Distribution libraries that are bundled anyway (by soname glob): not on packaging/binary_deps.py's base list, so a PC without them
 #: could not start the engine. Each one has its notice in packaging/notices/<name>.txt, which is copied to <out>/licenses/.
-BUNDLE_FROM_SYSTEM = ("libatomic.so.1",)
+BUNDLE_FROM_SYSTEM = ("libatomic.so.1", "libzstd.so.1")   # libzstd: the chunked disk tier's codec (STRATA_DISK_ZSTD)
 NOTICES = Path(__file__).resolve().parent / "notices"
 
 

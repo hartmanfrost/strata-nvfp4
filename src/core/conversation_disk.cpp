@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -432,6 +433,7 @@ bool ConversationDiskTier::open(std::string& error) {
         ChunkPoolOptions po;
         po.dir = pdir;
         po.codec = options_.codec;
+        po.zstd_level = options_.codec_level;
         po.min_free_bytes = options_.min_free_bytes;
         po.clock_s = options_.wall_clock_s;
         auto pool = std::make_unique<ChunkPool>(std::move(po));
@@ -454,9 +456,13 @@ bool ConversationDiskTier::open(std::string& error) {
     open_ = true;
     thread_ = std::thread([this] { writer(); });
     const std::string kept = options_.persist ? taken_in : fmt("%lld min per conversation", (long long) (options_.ttl_s / 60));
+    std::string codec = "raw";
+    if (options_.codec == ChunkCodec::zstd)
+        codec = codec_available(ChunkCodec::zstd) ? fmt("zstd:%d", options_.codec_level) : "raw (zstd is not built in)";
     log(fmt("on: %s, budget %.0f MiB, %s; %zu stale files removed%s", options_.dir.c_str(), mib(options_.budget_bytes),
             kept.c_str(), stale,
-            options_.chunked && pool_ ? fmt("; chunked format v2, %u tokens a slab, pool %s", options_.chunk_tokens,
+            options_.chunked && pool_ ? fmt("; chunked format v2, %u tokens a slab, codec %s, %d I/O workers, pool %s",
+                                            options_.chunk_tokens, codec.c_str(), options_.io_workers,
                                             pool_dir().c_str()).c_str() : ""));
     return true;
 }
@@ -1203,6 +1209,27 @@ std::string ConversationDiskTier::summary() const {
                (unsigned long long) s.tokens_back, s.waits, s.wait_ms, s.expired, s.evicted, s.superseded,
                s.write_failed, s.read_failed, entries_.size(), mib(bytes_ + pool_bytes_all()),
                queue_.size() + (writing_ ? 1 : 0), chunks.c_str());
+}
+
+bool conversation_disk_parse_codec(const std::string& text, ChunkCodec& codec, int& level, std::string& error) {
+    if (text == "raw") { codec = ChunkCodec::raw; level = 1; return true; }
+    if (text == "zstd" || text.rfind("zstd:", 0) == 0) {
+        int lv = 1;
+        if (text.size() > 4) {
+            const std::string num = text.substr(5);
+            if (num.empty() || num.size() > 2 || num.find_first_not_of("0123456789") != std::string::npos) {
+                error = "the zstd level is a number from 1 to 19";
+                return false;
+            }
+            lv = std::atoi(num.c_str());
+            if (lv < 1 || lv > 19) { error = "the zstd level is a number from 1 to 19"; return false; }
+        }
+        codec = ChunkCodec::zstd;
+        level = lv;
+        return true;
+    }
+    error = "the codec is raw, zstd or zstd:LEVEL";
+    return false;
 }
 
 }  // namespace strata::core
