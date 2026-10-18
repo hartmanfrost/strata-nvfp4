@@ -1140,14 +1140,14 @@ void test_limits() {
         SessionStatus st;
         check(!run(l, &st) && st.error == SessionError::memory, "a refusal is a memory failure");
     }
-    {
+    {   // (prefix reads: test_prefix)
         SavedConversation out = sentinel;
         size_t mb = 0;
         uint64_t rb = 0;
         std::string e;
         ChunkedReadOptions o;
-        o.upto = 10;
-        check(!chunked_read(*fx.pool, p, kId, out, mb, rb, e, {}, o) && !e.empty(), "prefix reads are refused until they exist");
+        o.upto = 1000000;
+        check(!chunked_read(*fx.pool, p, kId, out, mb, rb, e, {}, o) && !e.empty(), "a prefix beyond the image is refused");
     }
     // raw_bytes_read counts every chunk
     {
@@ -1299,6 +1299,147 @@ std::vector<uint8_t> shuffled_of(const std::vector<uint8_t>& v, uint8_t w) {
     std::vector<uint8_t> o(v.size());
     shuffle_bytes(v.data(), o.data(), v.size(), w);
     return o;
+}
+
+
+// The prefix image the reader must build for `upto` tokens of the Spec's image, from an independent construction: the
+// image of `upto` tokens (it shares the prefix bytes), its live state the checkpoint of that length (used = 0), the
+// checkpoints of at most that length, and each main layer's spare row the checkpoint's own `dead`.
+SavedConversation expect_prefix(const Spec& sp, int64_t upto) {
+    Spec e = sp;
+    e.n = upto;
+    e.live_gdn = sp.cp_gdn;
+    e.cps.clear();
+    for (int64_t t : sp.cps) if (t <= upto) e.cps.push_back(t);
+    SavedConversation x = make_image(e);
+    x.live.used = 0;
+    for (size_t l = 0; l < 2; ++l) {
+        auto& b = x.kv[l].pooled;
+        check(x.live.dead.size() == 2 * kRowBytes, "test: dead holds a row per main layer");
+        b.visit(b.size() - kRowBytes, kRowBytes, [&](uint8_t* q, size_t c, size_t at) {
+            std::memcpy(q, x.live.dead.data() + l * kRowBytes + (at - (b.size() - kRowBytes)), c);
+            return true;
+        });
+    }
+    return x;
+}
+
+void test_prefix_codec(ChunkCodec codec) {
+    Fx fx(codec == ChunkCodec::zstd ? "prefixz" : "prefix");
+    fx.codec = codec;
+    fx.make_pool(true);
+    Spec sp;
+    sp.n = 1500;
+    sp.cps = {101, 700, 1103};
+    sp.cp_gdn = 5000;
+    sp.live_gdn = (4u << 20) + 10;
+    const SavedConversation sentinel = make_image(Spec{});
+    for (uint32_t T : {64u, 512u}) {
+        const SavedConversation img = make_image(sp);
+        W w;
+        check(write_to(fx, fx.path("full.bin"), img, w, T), "prefix: the full image is written");
+        SavedConversation whole;
+        size_t mb = 0;
+        uint64_t rb_whole = 0;
+        std::string e;
+        check(chunked_read(*fx.pool, fx.path("full.bin"), kId, whole, mb, rb_whole, e, {}) && same(whole, img), "prefix: whole read");
+        for (int64_t upto : {101, 700, 1103}) {
+            const SavedConversation want = expect_prefix(sp, upto);
+            for (int workers : {1, 3}) {
+                SavedConversation out = sentinel;
+                ChunkedReadOptions o;
+                o.upto = upto;
+                o.workers = workers;
+                uint64_t rb = 0;
+                int asked = 0;
+                uint64_t need = 0;
+                SessionReadLimits lim;
+                lim.admit = [&](uint64_t n, std::string&) { ++asked; need = n; return true; };
+                check(chunked_read(*fx.pool, fx.path("full.bin"), kId, out, mb, rb, e, lim, o), "prefix: read");
+                check(same(out, want), "prefix: the image is the independent construction, byte for byte");
+                check(asked == 1, "prefix: admit once");
+                check(rb < rb_whole, "prefix: fewer bytes read than the whole image");
+                check(need < chunked_read_peak_bytes(rd<uint64_t>(slurp(fx.path("full.bin")), 48), workers, T), "prefix: admitted for the prefix, not the file");
+                check(out.live.ids.size() == (size_t) upto && out.kv[0].cells == (upto + 3) / 4 * 4 &&
+                      out.kv[0].pooled_rows == upto / 4 + 1 && out.kv[2].pooled_rows == 0, "prefix: geometry of the prefix");
+                // what the engine does next: a checkpoint of exactly `upto` is among the checkpoints
+                bool mount = false;
+                for (const auto& c : out.checkpoints) mount = mount || (int64_t) c.ids.size() == upto;
+                check(mount, "prefix: the checkpoint at upto is in the list");
+            }
+        }
+        // the whole length is the whole image; beyond it, below every checkpoint, or negative is refused and leaves `out`
+        {
+            SavedConversation out;
+            ChunkedReadOptions o;
+            uint64_t rb = 0;
+            o.upto = 1500;
+            check(chunked_read(*fx.pool, fx.path("full.bin"), kId, out, mb, rb, e, {}, o) && same(out, img), "prefix: upto == the live length is the whole image");
+            for (int64_t bad : {1501, 300, 100, 1, -5}) {
+                SavedConversation keep = sentinel;
+                o.upto = bad;
+                SessionStatus st;
+                check(!chunked_read(*fx.pool, fx.path("full.bin"), kId, keep, mb, rb, e, {}, o, &st) && !e.empty() && same(keep, sentinel),
+                      "prefix: no checkpoint of that length: refused, output untouched");
+            }
+        }
+        // only the chunks the prefix needs are read: the deepest slab may be gone
+        {
+            // slab refs come first in manifest order: the last slab is index n_slabs - 1
+            const uint64_t n_slabs = (uint64_t) ((1500 + T - 1) / T);
+            const ChunkRef deep = w.refs[n_slabs - 1];
+            const fs::path f = fx.pool->path_of(deep.key);
+            const auto bytes = slurp(f);
+            fs::remove(f);
+            fx.make_pool(true);   // forget the chunk
+            SavedConversation out;
+            ChunkedReadOptions o;
+            uint64_t rb = 0;
+            o.upto = 700;
+            check(chunked_read(*fx.pool, fx.path("full.bin"), kId, out, mb, rb, e, {}, o) && same(out, expect_prefix(sp, 700)),
+                  "prefix: a chunk past the prefix is not needed");
+            SavedConversation all;
+            check(!chunked_read(*fx.pool, fx.path("full.bin"), kId, all, mb, rb, e, {}) && e.find("missing") != std::string::npos, "prefix: the whole read needs it");
+            spit(f, bytes);   // back (the pool finds it again)
+            fx.make_pool(true);
+            check(chunked_read(*fx.pool, fx.path("full.bin"), kId, all, mb, rb, e, {}) && same(all, img), "prefix: whole read again");
+        }
+        // write "as of" a checkpoint: the image of that length, from an image and from sources, and the same as the prefix read
+        for (int64_t upto : {101, 700, 1103}) {
+            ChunkedWriteOptions o;
+            o.as_of_tokens = upto;
+            SavedConversation meta = img;
+            meta.kv.clear();
+            auto src = sources_of(img);
+            W wi, ws;
+            check(write_to(fx, fx.path("a.bin"), img, wi, T, o), "as-of: image write");
+            check(write_to(fx, fx.path("b.bin"), meta, ws, T, o, &src), "as-of: source write");
+            check(slurp(fx.path("a.bin")) == slurp(fx.path("b.bin")) && wi.refs == ws.refs, "as-of: sources == image, byte for byte");
+            SavedConversation back, pre;
+            check(read_from(fx, fx.path("a.bin"), back, e) && same(back, expect_prefix(sp, upto)), "as-of: reads back as the prefix image");
+            ChunkedReadOptions po;
+            po.upto = upto;
+            uint64_t rb = 0;
+            check(chunked_read(*fx.pool, fx.path("full.bin"), kId, pre, mb, rb, e, {}, po) && same(pre, back), "as-of: == the prefix read of the full image");
+            check(fs::file_size(fx.path("a.bin")) < fs::file_size(fx.path("full.bin")) + 1, "as-of: manifest is not larger");
+            if (upto >= 700) check(wi.stats.raw_bytes < w.stats.raw_bytes, "as-of: writes fewer bytes");
+            check(wi.stats.hits > 0, "as-of: the full image's slabs are hit");
+        }
+        for (int64_t bad : {300, 1500, 2000, -1}) {
+            ChunkedWriteOptions o;
+            o.as_of_tokens = bad;
+            W wf;
+            fs::remove(fx.path("c.bin"));
+            const bool ok = write_to(fx, fx.path("c.bin"), img, wf, T, o);
+            if (bad == -1) check(ok, "as-of: a negative value is no request");   // (= 0)
+            else check(!ok && wf.refs.empty() && !fs::exists(fx.path("c.bin")), "as-of: no such checkpoint: refused, nothing published");
+        }
+    }
+}
+
+void test_prefix() {
+    test_prefix_codec(ChunkCodec::raw);
+    if (codec_available(ChunkCodec::zstd)) { g_low_entropy = true; test_prefix_codec(ChunkCodec::zstd); g_low_entropy = false; }
 }
 
 void test_shuffle_and_skip() {
@@ -2096,6 +2237,7 @@ int main() {
     test_manifest_format();
     test_manifest_corruption();
     test_limits();
+    test_prefix();
     test_write_failures();
     test_shuffle_and_skip();
     test_codec_units();

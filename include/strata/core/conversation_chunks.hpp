@@ -154,6 +154,11 @@ struct ChunkedWriteOptions {
     // shared tier re-checks there that every chunk it hit is still on the disk
     std::function<bool(const std::vector<ChunkRef>&, std::string& why)> before_publish;
     std::function<int(const char* step)> fault;   // the manifest's steps as SessionWriteOptions::fault: "write", "file_flush", "rename", "dir_flush"
+    // > 0: write the image "as of" the checkpoint of exactly this many tokens (live-skip): that checkpoint becomes the
+    // live state, the deeper checkpoints and the live state's own running state are left out, and the K/V is cut to
+    // those tokens (the source is read from offset 0 as before, only less of it).  The result is the image the prefix
+    // read builds for the same length.  An error when no checkpoint of that length leads the live state.
+    int64_t as_of_tokens = 0;
 };
 struct ChunkedWriteStats {
     uint64_t manifest_bytes = 0, raw_bytes = 0, hit_raw_bytes = 0, new_file_bytes = 0;
@@ -171,7 +176,13 @@ bool chunked_write(ChunkPool&, const std::string& manifest_path, const SavedConv
                    SessionStatus* = nullptr);
 
 struct ChunkedReadOptions {
-    int64_t upto = 0;                   // > 0: the prefix image (not implemented yet: refused)
+    // > 0 (and below the live state's length): the prefix image of that many tokens - the checkpoint of exactly that
+    // length becomes the live state, the checkpoints of at most that length stay (the one at `upto` too: the engine
+    // mounts it), the K/V is cut to those tokens (cells up to the page that holds the last one, pooled rows
+    // upto/4 + 1 with the spare row from the checkpoint's `dead`), and only the slabs and state slices that image needs
+    // are read.  restorable by conversation_snapshot_restore unchanged.  An error when no checkpoint has that length;
+    // upto == the live length is the whole image.
+    int64_t upto = 0;
     int workers = 1;
 };
 // Full validation (manifest header, identity, hashes, bounded parse, every chunk) before `out` is replaced.

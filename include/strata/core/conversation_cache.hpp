@@ -211,6 +211,9 @@ struct SavedConversation {
     // the disk tier's entry holding exactly this image (conversation_disk.hpp: written while the engine was idle), 0 =
     // none.  A run-time mark only, not in the session file: an eviction then drops the RAM copy without a write.
     uint64_t disk_id = 0;
+    // > 0: that disk entry was written as of a checkpoint of this many tokens (live-skip), so it holds fewer tokens than
+    // this image; 0 = it holds the whole image.  Meaningful with disk_id only.
+    int64_t disk_cut = 0;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -271,6 +274,14 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     }
     if (j != c.imgs.size()) return 0;
     return (int64_t) n;
+}
+
+/// Whether the copy of `image` on the disk stands in for the image itself, so the RAM copy can be dropped (or the idle
+/// save skip it).  `on_disk`: the tier still has entry image.disk_id.  A copy cut at a checkpoint (live-skip) stands in
+/// only where cutting is allowed (`cut_ok`: the idle save, a plain eviction); RAM pressure and the QUIT-time save keep
+/// every token, so they write the image whole.
+inline bool conversation_disk_copy_suffices(const SavedConversation& image, bool on_disk, bool cut_ok) {
+    return image.disk_id != 0 && on_disk && (image.disk_cut == 0 || cut_ok);
 }
 
 class ConversationCache {
@@ -483,9 +494,9 @@ public:
     // wrote; the index is valid until the cache changes, the serial for good.
     const SavedConversation& at(size_t index) const { return entries_.at(index); }
     uint64_t serial_at(size_t index) const { return serials_.at(index); }
-    void set_disk_id(uint64_t serial, uint64_t disk_id) {
+    void set_disk_id(uint64_t serial, uint64_t disk_id, int64_t cut = 0) {
         const size_t i = index_of(serial);
-        if (i != SIZE_MAX) entries_[i].disk_id = disk_id;
+        if (i != SIZE_MAX) { entries_[i].disk_id = disk_id; entries_[i].disk_cut = cut; }
     }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:

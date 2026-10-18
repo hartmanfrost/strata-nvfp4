@@ -1153,6 +1153,10 @@ struct Options {
     /// --conversation-disk-codec raw|zstd[:level]: how the chunks are stored (zstd needs a build with STRATA_DISK_ZSTD)
     strata::core::ChunkCodec conversation_disk_codec = strata::core::ChunkCodec::raw;
     int conversation_disk_codec_level = 1;
+    /// --conversation-disk-live always|skip|auto and --conversation-disk-live-gap N (with --conversation-disk-chunked): whether
+    /// the live state is written when a checkpoint lies within N tokens of it (see strata::core::LivePolicy)
+    strata::core::LivePolicy conversation_disk_live = strata::core::LivePolicy::always;
+    int64_t conversation_disk_live_gap = 4096;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1367,6 +1371,12 @@ void usage() {
                  "  --conversation-disk-codec raw|zstd[:LEVEL]  --serve, with --conversation-disk-chunked: how chunks\n"
                  "                       are stored: raw (default; a compressing filesystem such as btrfs does the rest) or\n"
                  "                       zstd (default level 1, 1..19: byte-shuffled, tried per part, kept only where it pays)\n"
+                 "  --conversation-disk-live always|skip|auto  --serve, with --conversation-disk-chunked: whether a\n"
+                 "                       conversation's live state is written when a checkpoint lies within the gap behind\n"
+                 "                       it.  skip: not (the image is written as of that checkpoint: the next request reads\n"
+                 "                       the few tokens past it again, the disk takes much less); auto: skip for background\n"
+                 "                       writes only, never under RAM pressure or at QUIT; always (default): as before\n"
+                 "  --conversation-disk-live-gap N  --serve: the gap for --conversation-disk-live (tokens; default 4096)\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
@@ -4077,6 +4087,23 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--conversation-disk-codec: %s\n", why.c_str());
                 return 2;
             }
+        }
+        else if (a == "--conversation-disk-live") {
+            std::string why;
+            if (!strata::core::conversation_disk_parse_live(next("--conversation-disk-live"), o.conversation_disk_live, why)) {
+                std::fprintf(stderr, "--conversation-disk-live: %s\n", why.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--conversation-disk-live-gap") {
+            const std::string value = next("--conversation-disk-live-gap");
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0) {
+                std::fprintf(stderr, "--conversation-disk-live-gap needs a number of tokens (0 or more)\n");
+                return 2;
+            }
+            o.conversation_disk_live_gap = number;
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
@@ -14163,6 +14190,8 @@ int main(int argc, char** argv) {
         disk_opts.chunk_tokens = (uint32_t) o.conversation_disk_chunk_tokens;
         disk_opts.codec = o.conversation_disk_codec;
         disk_opts.codec_level = o.conversation_disk_codec_level;
+        disk_opts.live_policy = o.conversation_disk_live;
+        disk_opts.live_gap = o.conversation_disk_live_gap;
         if (o.conversation_disk_persist && !disk_opts.dir.empty()) {
             // the session files' identity: a later start with the same model and settings takes the files in
             std::string id_err;
@@ -14185,7 +14214,9 @@ int main(int argc, char** argv) {
         else if (conv_disk.enabled())
             conversations.set_on_evict([&conv_disk, &pressure_evicting](strata::core::SavedConversation&& image) {
                 // written to the disk while the engine was idle (the idle save): that copy stays, nothing to write
-                if (image.disk_id != 0 && conv_disk.has(image.disk_id)) return;
+                // (a copy cut at a checkpoint stays only when this eviction may cut: RAM pressure writes the image whole)
+                if (strata::core::conversation_disk_copy_suffices(image, image.disk_id != 0 && conv_disk.has(image.disk_id),
+                                                                  !pressure_evicting)) return;
                 disk_tier_handoff(image);
                 conv_disk.put(std::move(image), pressure_evicting);   // queued for the writer; a refusal is in its log
             });
@@ -14222,6 +14253,7 @@ int main(int argc, char** argv) {
                                   : o.conversation_disk_sync_s < 0 ? 60 : o.conversation_disk_sync_s;
         const bool live_sync_ok = stages.empty() && !multi_gpu && o.peer_device < 1 && o.batch <= 0 && o.prompt_cache > 0;
         uint64_t live_gen = 1, live_synced_gen = 0;   // the live conversation changes with every request
+        uint64_t live_cut_gen = 0;                    // the generation whose copy on the disk stops at a checkpoint (live-skip)
         Clock::time_point sync_blocked_until{};          // a failed idle save (not a request) waits 10 minutes
         if (conv_disk.persistent())
             std::fprintf(stderr, "strata serve: conversation disk: idle save %s%s\n",
@@ -14229,15 +14261,18 @@ int main(int argc, char** argv) {
                                          : "off (QUIT only)",
                          live_sync_ok ? "" : " (parked conversations only: the live one cannot be saved with a layer "
                                              "split, --peer-device or --batch)");
-        auto live_wants_sync = [&]() -> bool {
-            return live_sync_ok && live_ok && !live.empty() && live_synced_gen != live_gen &&
+        // `final_save`: the QUIT-time save keeps every token (--conversation-disk-live auto), so a live state the idle
+        // save wrote as of a checkpoint is written again whole
+        auto live_wants_sync = [&](bool final_save = false) -> bool {
+            return live_sync_ok && live_ok && !live.empty() &&
+                   (live_synced_gen != live_gen || (final_save && live_cut_gen == live_gen)) &&
                    conversations.wants((int64_t) live.size());
         };
         auto sync_pending = [&]() -> bool {
             if (disk_sync_s <= 0 || Clock::now() < sync_blocked_until) return false;
             for (size_t i = 0; i < conversations.size(); ++i) {
                 const auto& c = conversations.at(i);
-                if (c.disk_id == 0 || !conv_disk.has(c.disk_id)) return true;
+                if (!strata::core::conversation_disk_copy_suffices(c, c.disk_id != 0 && conv_disk.has(c.disk_id), true)) return true;
             }
             return live_wants_sync();
         };
@@ -14245,6 +14280,9 @@ int main(int argc, char** argv) {
         auto disk_sync = [&](const std::function<bool()>& cancel, const char* why) -> bool {
             if (!conv_disk.persistent()) return true;
             const auto t0 = Clock::now();
+            // the idle save can give way to a request (--conversation-disk-live auto skips the live state there); the
+            // QUIT-time save is the last chance and keeps every token
+            const bool background = std::strcmp(why, "idle") == 0;
             size_t wrote = 0;
             bool failed = false;
             auto fail = [&](const std::string& what) {
@@ -14252,7 +14290,7 @@ int main(int argc, char** argv) {
                 failed = true;
             };
             // the live conversation first: the one most likely to be continued (the main agent, usually)
-            if (live_wants_sync()) {
+            if (live_wants_sync(!background)) {
                 if (cancel && cancel()) return false;
                 std::string e;
                 if (!ver.wait_commit(e)) { fail(e); goto done; }   // the next request meets the same error (no device reads)
@@ -14275,8 +14313,10 @@ int main(int argc, char** argv) {
                         uint64_t id = 0;
                         bool cancelled = false;
                         disk_tier_join();   // (the checkpoints lent to it may still be landing)
-                        if (conv_disk.write_now(meta, &sources, cancel, id, e, &cancelled)) {
+                        int64_t as_of = 0;
+                        if (conv_disk.write_now(meta, &sources, cancel, id, e, &cancelled, background, &as_of)) {
                             live_synced_gen = live_gen;
+                            live_cut_gen = as_of > 0 ? live_gen : 0;
                             ++wrote;
                         } else if (cancelled) {
                             return false;
@@ -14294,14 +14334,17 @@ int main(int argc, char** argv) {
             // failed (over the budget, say) does not keep them from the disk
             for (size_t i = 0; i < conversations.size(); ++i) {
                 const auto& img = conversations.at(i);
-                if (img.disk_id != 0 && conv_disk.has(img.disk_id)) continue;
+                // the idle save leaves a copy cut at a checkpoint as it is; the QUIT-time save keeps every token, so it
+                // writes such a parked conversation again whole (the eviction after it then drops the RAM image)
+                if (strata::core::conversation_disk_copy_suffices(img, img.disk_id != 0 && conv_disk.has(img.disk_id), background)) continue;
                 if (cancel && cancel()) return false;
                 uint64_t id = 0;
                 bool cancelled = false;
                 std::string e;
                 disk_tier_join();   // (the image stays in RAM: its copy tokens with it)
-                if (conv_disk.write_now(img, nullptr, cancel, id, e, &cancelled)) {
-                    conversations.set_disk_id(conversations.serial_at(i), id);
+                int64_t as_of = 0;
+                if (conv_disk.write_now(img, nullptr, cancel, id, e, &cancelled, background, &as_of)) {
+                    conversations.set_disk_id(conversations.serial_at(i), id, as_of);
                     ++wrote;
                 } else if (cancelled) {
                     return false;
@@ -19254,7 +19297,11 @@ int main(int argc, char** argv) {
                     // conversation is written it is the one that survives a crash), and a checkpoint match is a
                     // sibling borrowing that conversation's prefix (#1164's rule for the RAM cache)
                     const bool keep = conv_disk.persistent() || !on_disk.live;
-                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit, keep)) {
+                    // a checkpoint match (not the live state): a chunked entry gives just the prefix up to that checkpoint -
+                    // its K/V head and one running state - as an image of exactly that length (a v1 entry, or one still in
+                    // the write queue, gives the whole image as before); either restores below the same way
+                    const int64_t prefix_upto = on_disk.live ? 0 : on_disk.tokens;
+                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit, keep, prefix_upto)) {
                         disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
                         incoming.emplace(std::move(image));
                         parked.tokens = on_disk.tokens;

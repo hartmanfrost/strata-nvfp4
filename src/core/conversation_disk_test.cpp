@@ -626,6 +626,396 @@ SavedConversation continued(size_t tokens, uint8_t seed) {
     return s;
 }
 
+// An image whose K/V geometry is the real one for its tokens (what a prefix of it needs): cells = ceil(tokens/4)*4 of 4
+// cells a page, pooled rows tokens/4 + 1 of 32 bytes (the last is the spare row), two main layers and a draft layer;
+// checkpoints at `cps` (deepest first, as the engine keeps them), each with a state of 4099 bytes and 64 bytes of
+// `dead` (a row per main layer).
+SavedConversation geo_image(size_t tokens, uint8_t seed, std::vector<size_t> cps, int32_t first = 1000) {
+    SavedConversation s;
+    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
+    s.layer_lo = 0; s.layer_hi = 48;
+    s.cvec = false;
+    s.live = checkpoint(tokens, seed, first);
+    for (size_t t : cps) s.checkpoints.push_back(checkpoint(t, uint8_t(seed + t % 50), first));
+    const int64_t cells = int64_t((tokens + 3) / 4 * 4);
+    for (int layer = 0; layer < 3; ++layer) {
+        const bool draft = layer == 2;
+        ConversationKv kv;
+        kv.format = draft ? 1 : 2; kv.cells = cells; kv.heads = 2; kv.head_dim = 256; kv.page_size = 4; kv.idx_dim = 8;
+        kv.pooled_rows = draft ? 0 : int64_t(tokens / 4 + 1);
+        kv.k = pattern(size_t(cells) * 8, uint8_t(seed + layer));
+        kv.v = pattern(size_t(cells) * (draft ? 8 : 4), uint8_t(seed + 10 + layer));
+        kv.k_scale = pattern(size_t(cells) * 2, uint8_t(seed + 20 + layer));
+        kv.v_scale = pattern(draft ? size_t(cells) * 2 : 0, uint8_t(seed + 30));
+        kv.pooled = pattern(size_t(kv.pooled_rows) * 32, uint8_t(seed + 40 + layer));
+        s.kv.push_back(std::move(kv));
+    }
+    return s;
+}
+
+// `out` is the prefix image of `full` at its checkpoint of `upto` tokens: live = that checkpoint, the checkpoints up to
+// it, every layer's K/V the head of the full one, the spare row of a main layer the checkpoint's own
+bool is_prefix_of(const SavedConversation& out, const SavedConversation& full, size_t upto) {
+    const ConversationCheckpoint* at = nullptr;
+    std::vector<const ConversationCheckpoint*> kept;
+    for (const auto& c : full.checkpoints) {
+        if (c.ids.size() > upto) continue;
+        kept.push_back(&c);
+        if (c.ids.size() == upto) at = &c;
+    }
+    if (!at || out.checkpoints.size() != kept.size() || out.kv.size() != full.kv.size() || out.cvec != full.cvec ||
+        out.geometry != full.geometry || !out.stage_images.empty()) return false;
+    for (size_t i = 0; i < kept.size(); ++i)
+        if (!same_checkpoint(out.checkpoints[i], *kept[i])) return false;
+    ConversationCheckpoint live = *at;
+    live.used = 0;
+    if (!same_checkpoint(out.live, live)) return false;
+    const int64_t cells = int64_t((upto + 3) / 4 * 4);
+    for (size_t l = 0; l < full.kv.size(); ++l) {
+        const auto& x = out.kv[l]; const auto& y = full.kv[l];
+        const bool index = y.pooled_rows > 0;
+        if (x.cells != cells || x.pooled_rows != (index ? int64_t(upto / 4 + 1) : 0) || x.format != y.format ||
+            x.page_size != y.page_size || x.heads != y.heads || x.head_dim != y.head_dim || x.idx_dim != y.idx_dim) return false;
+        const ConversationBuffer* a[5] = {&x.k, &x.v, &x.k_scale, &x.v_scale, &x.pooled};
+        const ConversationBuffer* b[5] = {&y.k, &y.v, &y.k_scale, &y.v_scale, &y.pooled};
+        for (int part = 0; part < 4; ++part) {
+            const size_t unit = y.cells ? b[part]->size() / size_t(y.cells) : 0;
+            if (a[part]->size() != unit * size_t(cells)) return false;
+            std::vector<uint8_t> p(a[part]->size()), q(a[part]->size());
+            a[part]->read(p.data(), 0, p.size());
+            b[part]->read(q.data(), 0, q.size());
+            if (p != q) return false;
+        }
+        if (index) {
+            const size_t data = size_t(upto / 4) * 32;
+            if (x.pooled.size() != data + 32) return false;
+            std::vector<uint8_t> p(x.pooled.size()), q(data);
+            x.pooled.read(p.data(), 0, p.size());
+            y.pooled.read(q.data(), 0, q.size());
+            if (!std::equal(q.begin(), q.end(), p.begin())) return false;
+            const size_t j = size_t(l);   // main layer j: row j of the checkpoint's dead
+            if (!std::equal(p.begin() + (std::ptrdiff_t) data, p.end(), at->dead.begin() + (std::ptrdiff_t) (j * 32))) return false;
+        } else if (!x.pooled.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 11. prefix read and live-skip
+void prefix_suite(const fs::path& dir) {
+    const uint64_t GiB = 1ull << 30;
+    std::string e;
+    fs::remove_all(dir);
+
+    {   // the policy function and its flag
+        using P = LivePolicy;
+        check(!conversation_disk_skip_live(P::always, 1000, 900, 4096), "live policy: always never skips");
+        check(conversation_disk_skip_live(P::skip, 1000, 900, 4096) && conversation_disk_skip_live(P::automatic, 1000, 900, 4096),
+              "live policy: skip and auto skip within the gap");
+        check(conversation_disk_skip_live(P::skip, 5000, 904, 4096) && !conversation_disk_skip_live(P::skip, 5001, 904, 4096),
+              "live policy: the gap is inclusive");
+        check(!conversation_disk_skip_live(P::skip, 1000, 0, 4096) && !conversation_disk_skip_live(P::skip, 1000, -1, 4096),
+              "live policy: no checkpoint, no skip");
+        check(!conversation_disk_skip_live(P::skip, 1000, 1000, 4096) && !conversation_disk_skip_live(P::skip, 1000, 1200, 4096),
+              "live policy: nothing to skip when the checkpoint is not behind the live state");
+        check(!conversation_disk_skip_live(P::skip, 1000, 900, 50) && conversation_disk_skip_live(P::skip, 1000, 900, 100) &&
+              !conversation_disk_skip_live(P::skip, 1000, 900, -5), "live policy: a smaller gap");
+        P p = P::skip;
+        std::string why;
+        check(conversation_disk_parse_live("always", p, why) && p == P::always && conversation_disk_parse_live("skip", p, why) &&
+              p == P::skip && conversation_disk_parse_live("auto", p, why) && p == P::automatic, "live flag: the three words");
+        for (const char* bad : {"", "Skip", "never", "auto:1", "skip "})
+            check(!conversation_disk_parse_live(bad, p, why) && !why.empty(), "live flag: refused");
+    }
+
+    auto chunked_opts = [&](uint32_t T) {
+        auto o = opts(dir, GiB, 1800);
+        o.chunked = true;
+        o.chunk_tokens = T;
+        return o;
+    };
+    {   // prefix read from a kept entry: a checkpoint match reads the head of the K/V and one running state
+        ConversationDiskTier tier(chunked_opts(64));
+        check(tier.open(e), "prefix: open");
+        const SavedConversation full = geo_image(1000, 60, {600, 300, 120});
+        uint64_t id = 0;
+        check(tier.write_now(full, nullptr, {}, id, e), "prefix: written");
+        const auto ck = tier.best([] { auto p = prompt_of(400); p.push_back(7); return p; }(), {}, false);
+        check(ck.id == id && ck.tokens == 300 && !ck.live, "prefix: best finds the checkpoint at 300");
+        SavedConversation back;
+        check(tier.take(ck.id, ck.tokens, back, e, {}, true, ck.tokens), "prefix: take with upto");
+        check(is_prefix_of(back, full, 300), "prefix: the image is the 300-token prefix (K/V head, checkpoints <= 300, live = the checkpoint)");
+        const auto s = tier.stats();
+        check(s.prefix_reads == 1 && s.prefix_raw_bytes > 0 && s.prefix_raw_bytes < s.raw_bytes / 2, "prefix: read much less than the entry holds");
+        check(logged("prefix read of 300 of 1000 tokens") && tier.size() == 1, "prefix: logged, and the entry stays (kept)");
+        check(tier.summary().find("1 prefix reads") != std::string::npos, "prefix: in the totals");
+        // not a prefix read: no keep, an upto that is no checkpoint, the live length, no upto
+        SavedConversation w;
+        check(tier.take(id, 300, w, e, {}, true, 301) && same(w, full), "prefix: upto without a checkpoint of that length: the whole entry");
+        check(tier.take(id, 600, w, e, {}, true, 1000) && same(w, full), "prefix: upto = the live length: the whole entry");
+        check(tier.take(id, 600, w, e, {}, true) && same(w, full), "prefix: no upto: the whole entry");
+        check(tier.stats().prefix_reads == 1, "prefix: none of those was a prefix read");
+        check(tier.take(id, 600, back, e, {}, true, 600) && is_prefix_of(back, full, 600), "prefix: the deepest checkpoint");
+        check(tier.take(id, 120, back, e, {}, true, 120) && is_prefix_of(back, full, 120), "prefix: the shallowest checkpoint");
+        // without keep the entry is consumed and read whole
+        check(tier.take(id, 300, w, e, {}, false, 300) && same(w, full) && tier.size() == 0, "prefix: without keep the whole entry is read and removed");
+    }
+    {   // a refusal of the RAM gate sees the prefix's size, not the entry's
+        ConversationDiskTier tier(chunked_opts(64));
+        check(tier.open(e), "prefix admit: open");
+        const SavedConversation full = geo_image(1000, 61, {600, 300});
+        uint64_t id = 0;
+        check(tier.write_now(full, nullptr, {}, id, e), "prefix admit: written");
+        uint64_t need_whole = 0, need_prefix = 0;
+        SavedConversation back;
+        check(tier.take(id, 600, back, e, [&](uint64_t n, std::string&) { need_whole = n; return true; }, true), "prefix admit: whole");
+        check(tier.take(id, 300, back, e, [&](uint64_t n, std::string&) { need_prefix = n; return true; }, true, 300), "prefix admit: prefix");
+        check(need_prefix > 0 && need_prefix < need_whole, "prefix admit: smaller for the prefix");
+        check(!tier.take(id, 300, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; }, true, 300) &&
+              back.live.ids.empty() && e.find("no RAM") != std::string::npos, "prefix admit: a refusal fails the take");
+    }
+    {   // live-skip: the image is written as of the deepest checkpoint
+        auto so = chunked_opts(64);
+        so.live_policy = LivePolicy::skip;
+        so.live_gap = 4096;
+        ConversationDiskTier skip(so);
+        check(skip.open(e), "skip: open");
+        const SavedConversation full = geo_image(1000, 62, {600, 300});
+        uint64_t id = 0;
+        check(skip.write_now(full, nullptr, {}, id, e), "skip: written");
+        const auto st = skip.stats();
+        check(st.live_skipped == 1 && st.live_skipped_tokens == 400 && logged("live state not written: as of the checkpoint at 600"),
+              "skip: counted and logged");
+        check(skip.best(prompt_of(1100), {}, false).tokens == 600 && skip.best(prompt_of(1100), {}, false).live,
+              "skip: the entry's live state is now the checkpoint's 600 tokens (the 1000 are gone)");
+        uint64_t again = 0;
+        check(skip.write_now(full, nullptr, {}, again, e) && again == id && skip.size() == 1, "skip: the same image is not written twice");
+        SavedConversation back;
+        check(skip.take(id, 600, back, e, {}, true) && is_prefix_of(back, full, 600), "skip: the file holds the image of 600 tokens");
+        // against a tier that writes everything: fewer bytes, and the same conversation resumes from 600 either way
+        fs::create_directories(dir / "all");
+        auto ao = opts(dir / "all", GiB, 1800);
+        ao.chunked = true;
+        ao.chunk_tokens = 64;
+        ConversationDiskTier all(ao);
+        uint64_t aid = 0;
+        check(all.open(e) && all.write_now(full, nullptr, {}, aid, e), "skip: reference written");
+        check(st.raw_bytes < all.stats().raw_bytes && all.best(prompt_of(1100), {}, false).tokens == 1000,
+              "skip: fewer bytes than writing the live state");
+    }
+    {
+        // a checkpoint 400 behind with a gap of 300: written whole
+        auto go = chunked_opts(64);
+        go.live_policy = LivePolicy::skip;
+        go.live_gap = 300;
+        fs::create_directories(dir / "gap");
+        go.dir = (dir / "gap").string();
+        ConversationDiskTier gap(go);
+        uint64_t id = 0;
+        check(gap.open(e) && gap.write_now(geo_image(1000, 63, {600, 300}), nullptr, {}, id, e), "gap: written");
+        check(gap.stats().live_skipped == 0 && gap.best(prompt_of(1100), {}, false).tokens == 1000, "gap: too far behind: the live state is written");
+        // no checkpoint at all
+        uint64_t id2 = 0;
+        check(gap.write_now(geo_image(500, 64, {}, 3000), nullptr, {}, id2, e) && gap.stats().live_skipped == 0 &&
+              gap.best(prompt_of(600, 3000), {}, false).tokens == 500, "gap: no checkpoint: written whole");
+    }
+    {   // auto: a background write skips, RAM pressure and the QUIT-time save keep the live state; skip always skips
+        fs::remove_all(dir);
+        auto ao = chunked_opts(64);
+        ao.live_policy = LivePolicy::automatic;
+        ConversationDiskTier t(ao);
+        check(t.open(e), "auto: open");
+        uint64_t id = 0;
+        check(t.put(geo_image(1000, 65, {600, 300}), true), "auto: put under pressure");
+        t.wait_idle();
+        check(t.stats().live_skipped == 0 && t.best(prompt_of(1100), {}, false).tokens == 1000, "auto: pressure keeps the live state");
+        check(t.put(geo_image(900, 66, {500, 200}, 2000)), "auto: put in the background");
+        t.wait_idle();
+        check(t.stats().live_skipped == 1 && t.best(prompt_of(1000, 2000), {}, false).tokens == 500, "auto: a background write skips");
+        check(t.write_now(geo_image(800, 67, {400}, 4000), nullptr, {}, id, e, nullptr, false) && t.stats().live_skipped == 1 &&
+              t.best(prompt_of(900, 4000), {}, false).tokens == 800, "auto: the QUIT-time save keeps the live state");
+        check(t.write_now(geo_image(700, 68, {300}, 5000), nullptr, {}, id, e, nullptr, true) && t.stats().live_skipped == 2 &&
+              t.best(prompt_of(800, 5000), {}, false).tokens == 300, "auto: the idle save skips");
+        auto so = chunked_opts(64);
+        so.live_policy = LivePolicy::skip;
+        ConversationDiskTier t2(so);
+        check(t2.open(e) && t2.put(geo_image(1000, 69, {600}, 7000), true), "skip: put under pressure");
+        t2.wait_idle();
+        check(t2.stats().live_skipped == 1, "skip: even under pressure");
+    }
+    {   // auto: a parked conversation the idle save wrote cut at a checkpoint is not "on the disk" for RAM pressure or the
+        // QUIT-time save: they write it whole, where the RAM copy would otherwise be dropped and only the cut copy survive
+        fs::remove_all(dir);
+        auto ao = chunked_opts(64);
+        ao.live_policy = LivePolicy::automatic;
+        ConversationDiskTier t(ao);
+        check(t.open(e), "cut copy: open");
+        ConversationCache cache(GiB, 1);
+        bool pressure = false;
+        size_t put_calls = 0;
+        cache.set_on_evict([&](SavedConversation&& s) {
+            if (conversation_disk_copy_suffices(s, s.disk_id != 0 && t.has(s.disk_id), !pressure)) return;
+            ++put_calls;
+            t.put(std::move(s), pressure);
+        });
+        check(cache.put(geo_image(1000, 80, {600, 300})), "cut copy: park a");
+        uint64_t id = 0;
+        int64_t as_of = 0;
+        check(t.write_now(cache.at(0), nullptr, {}, id, e, nullptr, true, &as_of) && as_of == 600, "cut copy: the idle save cuts a at 600");
+        cache.set_disk_id(cache.serial_at(0), id, as_of);
+        check(cache.at(0).disk_cut == 600, "cut copy: the mark records the cut");
+        check(conversation_disk_copy_suffices(cache.at(0), true, true) && !conversation_disk_copy_suffices(cache.at(0), true, false) &&
+              !conversation_disk_copy_suffices(cache.at(0), false, true), "cut copy: stands in only where cutting is allowed");
+        cache.set_disk_id(cache.serial_at(0), id, 0);
+        check(conversation_disk_copy_suffices(cache.at(0), true, false), "cut copy: a whole copy stands in everywhere");
+        cache.set_disk_id(cache.serial_at(0), id, as_of);
+        pressure = true;
+        check(cache.put(geo_image(900, 81, {500}, 2000)), "cut copy: park b: a leaves RAM under pressure");
+        t.wait_idle();
+        check(put_calls == 1, "cut copy: pressure wrote a whole instead of dropping it");
+        check(t.best(prompt_of(1100), {}, false).tokens == 1000, "cut copy: the disk now holds all 1000 tokens of a");
+        // the QUIT-time save: write_now with background=false of an image carrying a cut copy writes it whole
+        fs::create_directories(dir / "quit");
+        auto qo = ao;
+        qo.dir = (dir / "quit").string();
+        ConversationDiskTier q2(qo);
+        uint64_t qid = 0, qid2 = 0;
+        int64_t qas = 0;
+        const SavedConversation img = geo_image(1000, 82, {600, 300}, 6000);
+        check(q2.open(e) && q2.write_now(img, nullptr, {}, qid, e, nullptr, true, &qas) && qas == 600 &&
+              q2.write_now(img, nullptr, {}, qid2, e, nullptr, false, &qas) && qas == 0 && qid2 != qid &&
+              q2.best(prompt_of(1100, 6000), {}, false).tokens == 1000, "cut copy: the QUIT-time write supersedes the cut one with the whole image");
+    }
+    {   // take without keep pins the entry's chunks: a pressure sweep another write triggers during the read (the entry is
+        // already gone, so they are ghosts) must not delete them
+        fs::remove_all(dir);
+        const SavedConversation a = geo_image(1000, 90, {600, 300});
+        const SavedConversation b = geo_image(1000, 91, {600, 300}, 8000);   // the same size: both do not fit
+        uint64_t budget = 0;
+        {
+            fs::create_directories(dir / "probe");
+            auto po = chunked_opts(64);
+            po.dir = (dir / "probe").string();
+            ConversationDiskTier probe(po);
+            uint64_t pid = 0;
+            check(probe.open(e) && probe.write_now(a, nullptr, {}, pid, e), "pin: probe");
+            budget = std::max<uint64_t>(probe.bytes(), a.bytes()) + 4096;   // a write is refused over it (the image's estimate)
+        }
+        auto bo = chunked_opts(64);
+        bo.budget_bytes = budget;
+        fs::create_directories(dir / "pin");
+        bo.dir = (dir / "pin").string();
+        ConversationDiskTier t(bo);
+        uint64_t aid = 0, bid = 0;
+        check(t.open(e) && t.write_now(a, nullptr, {}, aid, e), "pin: a written");
+        SavedConversation back;
+        bool wrote_b = false;
+        const bool ok = t.take(aid, 1000, back, e, [&](uint64_t, std::string&) {
+            wrote_b = t.write_now(b, nullptr, {}, bid, e);   // over the budget: the pressure sweep runs now
+            return true;
+        }, false);
+        check(wrote_b, "pin: b was written during the read");
+        check(ok && same(back, a), "pin: the read finishes although a pressure sweep ran while it read");
+    }
+    {   // best() reports a queued or running write with the keys it was queued with; live-skip then cuts the entry at
+        // its checkpoint: a take of the reported length must miss (the image holds fewer tokens), not hand back a short
+        // image the engine would resume past
+        fs::remove_all(dir);
+        std::promise<void> release;
+        std::shared_future<void> gate = release.get_future().share();
+        auto so = chunked_opts(64);
+        so.live_policy = LivePolicy::skip;
+        so.before_write = [gate] { gate.wait(); };
+        ConversationDiskTier t(so);
+        check(t.open(e), "skip race: open");
+        const SavedConversation full = geo_image(1000, 71, {600, 300});
+        check(t.put(SavedConversation(full)), "skip race: put (the writer takes it and waits)");
+        const auto m = t.best(prompt_of(1100), {}, false);
+        check(m.id != 0 && m.tokens == 1000 && m.live, "skip race: best reports the full live state of the running write");
+        std::promise<bool> taken;
+        std::thread th([&] {
+            SavedConversation back;
+            std::string err;
+            taken.set_value(t.take(m.id, m.tokens, back, err, {}, false) || !back.live.ids.empty());
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        release.set_value();
+        th.join();
+        check(!taken.get_future().get(), "skip race: take of 1000 tokens misses once the write cut the entry at 600");
+        check(t.size() == 1 && t.best(prompt_of(1100), {}, false).tokens == 600, "skip race: the entry stays, as its 600-token checkpoint");
+        SavedConversation back;
+        const auto m2 = t.best(prompt_of(1100), {}, false);
+        check(t.take(m2.id, m2.tokens, back, e, {}, true) && is_prefix_of(back, full, 600), "skip race: a take of the real length reads it");
+    }
+    {   // shared: the chunks a write hit are looked at again before its manifest appears (another engine's sweep may
+        // have taken them); a write that finds one gone fails instead of publishing a manifest that names it
+        fs::remove_all(dir);
+        auto so = chunked_opts(64);
+        so.persist = true;
+        so.shared = true;
+        so.identity = {2, 9};
+        bool fire = false;
+        so.before_manifest = [&] {
+            if (!fire) return;
+            for (const auto& f : fs::recursive_directory_iterator(dir))
+                if (f.path().extension() == ".chk") fs::remove(f.path());
+        };
+        ConversationDiskTier t(so);
+        check(t.open(e), "shared publish: open");
+        uint64_t id = 0;
+        check(t.write_now(geo_image(300, 72, {100}), nullptr, {}, id, e), "shared publish: a write with no sweep is fine");
+        fire = true;
+        check(!t.write_now(geo_image(300, 73, {100}, 4000), nullptr, {}, id, e) && e.find("vanished before the manifest") != std::string::npos,
+              "shared publish: a chunk gone before the manifest fails the write");
+        size_t manifests = 0;
+        for (const auto& f : fs::directory_iterator(dir)) manifests += f.path().extension() == ".bin";
+        check(manifests == 1, "shared publish: no manifest of the failed write is left");
+    }
+    {   // a write that runs out of disk frees the ghosts of earlier takes at once (not after the grace): the retry fits
+        fs::remove_all(dir);
+        auto po = chunked_opts(64);
+        po.persist = true;
+        po.identity = {3, 9};
+        {
+            ConversationDiskTier t(po);
+            uint64_t id = 0;
+            SavedConversation back;
+            check(t.open(e) && t.write_now(geo_image(600, 74, {300}), nullptr, {}, id, e) && t.take(id, 600, back, e),
+                  "full disk: an entry written and taken (its chunks are ghosts)");
+        }
+        auto lo = po;
+        lo.min_free_bytes = UINT64_MAX / 2;   // no disk has this much room: every new chunk is refused
+        ConversationDiskTier t(lo);
+        uint64_t id = 0;
+        check(t.open(e), "full disk: reopen");
+        check(!t.write_now(geo_image(600, 75, {300}, 9000), nullptr, {}, id, e) && t.stats().chunks_swept > 0,
+              "full disk: the failed write swept the ghosts (grace not waited for)");
+    }
+    {   // persist: the index names what the file holds; a restart takes it in and a prefix read works on it
+        fs::remove_all(dir);
+        auto po = chunked_opts(64);
+        po.persist = true;
+        po.identity = {1, 7};
+        po.live_policy = LivePolicy::skip;
+        const SavedConversation full = geo_image(1000, 70, {600, 300});
+        {
+            ConversationDiskTier t(po);
+            uint64_t id = 0;
+            check(t.open(e) && t.write_now(full, nullptr, {}, id, e) && t.stats().live_skipped == 1, "persist skip: written");
+        }
+        auto ro = po;
+        ro.live_policy = LivePolicy::always;
+        ConversationDiskTier t(ro);
+        check(t.open(e) && t.size() == 1, "persist skip: taken in by the next start");
+        const auto m = t.best(prompt_of(1100), {}, false);
+        check(m.tokens == 600 && m.live, "persist skip: the index holds the 600-token state as the live one, not the 1000");
+        SavedConversation back;
+        check(t.take(m.id, m.tokens, back, e, {}, true, m.tokens) && is_prefix_of(back, full, 600), "persist skip: readable");
+    }
+    fs::remove_all(dir);
+}
+
 void chunked_suite(const fs::path& dir) {
     const uint64_t GiB = 1ull << 30;
     std::string e;
@@ -948,6 +1338,7 @@ void chunked_suite(const fs::path& dir) {
         check(m.tokens == 400 && t.take(m.id, m.tokens, back, e) && same(back, image(400, 97)), "codec: reads back exactly");
         g_random_fill = saved;
     }
+    prefix_suite(dir);
 }
 }  // namespace
 

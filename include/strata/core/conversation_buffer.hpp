@@ -116,7 +116,8 @@ public:
     }
     void pop_back() { resize(size_ - 1); }
     // resize() without the zero fill of what it adds (the fresh pages are not touched here): only for a caller that
-    // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
+    // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy; the chunked v2 disk reader,
+    // which counts the bytes it stored per part and refuses the image when they do not add up to the part's size)
     void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.

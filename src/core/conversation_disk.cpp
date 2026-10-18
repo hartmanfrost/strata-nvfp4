@@ -141,7 +141,7 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
 #endif
 std::string fmt(const char* f, ...) {
-    char buf[1024];
+    char buf[2048];
     va_list ap;
     va_start(ap, f);
     std::vsnprintf(buf, sizeof buf, f, ap);
@@ -461,8 +461,12 @@ bool ConversationDiskTier::open(std::string& error) {
         codec = codec_available(ChunkCodec::zstd) ? fmt("zstd:%d", options_.codec_level) : "raw (zstd is not built in)";
     log(fmt("on: %s, budget %.0f MiB, %s; %zu stale files removed%s", options_.dir.c_str(), mib(options_.budget_bytes),
             kept.c_str(), stale,
-            options_.chunked && pool_ ? fmt("; chunked format v2, %u tokens a slab, codec %s, %d I/O workers, pool %s",
+            options_.chunked && pool_ ? fmt("; chunked format v2, %u tokens a slab, codec %s, %d I/O workers, live state %s, pool %s",
                                             options_.chunk_tokens, codec.c_str(), options_.io_workers,
+                                            options_.live_policy == LivePolicy::always ? "always written"
+                                            : fmt("%s when a checkpoint is within %lld tokens",
+                                                  options_.live_policy == LivePolicy::skip ? "skipped" : "skipped in background writes",
+                                                  (long long) options_.live_gap).c_str(),
                                             pool_dir().c_str()).c_str() : ""));
     return true;
 }
@@ -580,9 +584,31 @@ void ConversationDiskTier::writer() {
     }
 }
 
+namespace {
+std::string skip_note(size_t live, int64_t as_of) {
+    return fmt("; live state not written: as of the checkpoint at %lld tokens (%zu tokens left out)", (long long) as_of,
+               live - (size_t) as_of);
+}
+}  // namespace
+
+int64_t ConversationDiskTier::live_skip_tokens(const SavedConversation& img, bool background) const {
+    // only the chunked writer can cut an image (the v1 file holds the K/V as it is), and a layer split's stage images
+    // are not cut here (each stage would need its own checkpoint set): they are written whole
+    if (!options_.chunked || !pool_ || options_.live_policy == LivePolicy::always || !img.stage_images.empty()) return 0;
+    if (options_.live_policy == LivePolicy::automatic && !background) return 0;
+    const int64_t live = (int64_t) img.live.ids.size();
+    int64_t deepest = 0;
+    for (const auto& c : img.checkpoints) {
+        const int64_t n = (int64_t) c.ids.size();
+        if (n > deepest && n < live && c.stage_parts.empty() && std::equal(c.ids.begin(), c.ids.end(), img.live.ids.begin()))
+            deepest = n;
+    }
+    return conversation_disk_skip_live(options_.live_policy, live, deepest, options_.live_gap) ? deepest : 0;
+}
+
 bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
                                        const std::vector<SessionKvSource>* sources,
-                                       const std::function<bool()>& cancel, std::string& error, bool flush) {
+                                       const std::function<bool()>& cancel, std::string& error, bool flush, int64_t as_of) {
     const SessionFileIdentity id = file_identity();
     SessionWriteOptions wo;
     wo.min_free_bytes = options_.min_free_bytes;
@@ -608,7 +634,8 @@ bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
             co.min_free_bytes = options_.min_free_bytes;
             co.workers = options_.io_workers;
             co.cancel = cancel;
-            if (options_.shared)   // another engine's sweep may have taken a chunk this write hit: look again
+            co.as_of_tokens = k == 0 ? as_of : 0;
+            if (options_.shared || options_.before_manifest)   // another engine's sweep may have taken a chunk this write hit: look again
                 co.before_publish = [this](const std::vector<ChunkRef>& refs, std::string& why) {
                     if (options_.before_manifest) options_.before_manifest();
                     if (!options_.shared) return true;
@@ -650,6 +677,14 @@ bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
     };
     bool ok = write_one(img, sources, 0);
     for (size_t k = 0; ok && k < img.stage_images.size(); ++k) ok = write_one(img.stage_images[k], nullptr, k + 1);
+    if (ok && as_of > 0) {
+        // what is on the disk is the image of `as_of` tokens: its keys are the entry's (best() and the index say so)
+        e.checkpoints.clear();
+        for (const auto& c : img.checkpoints) {
+            if ((int64_t) c.ids.size() < as_of) e.checkpoints.push_back(key_of(c));
+            else if ((int64_t) c.ids.size() == as_of) { e.live = key_of(c); e.checkpoints.push_back(key_of(c)); }
+        }
+    }
     if (ok && options_.persist) {
         if (options_.shared) {   // ours: rescan() must not take it in as another engine's (it is seen before it exists)
             char name[96];
@@ -873,7 +908,8 @@ void ConversationDiskTier::write(Job& job) {
     const auto t0 = std::chrono::steady_clock::now();
     Entry e = std::move(job.entry);
     std::string error;
-    const bool ok = write_files(e, job.image, nullptr, {}, error, job.flush);
+    const int64_t as_of = live_skip_tokens(job.image, !job.flush);   // RAM pressure (flush) keeps every token
+    const bool ok = write_files(e, job.image, nullptr, {}, error, job.flush, as_of);
     job.image = SavedConversation{};   // the RAM goes back now, written or not
     const double ms = ms_since(t0);
     if (!ok) {
@@ -887,10 +923,11 @@ void ConversationDiskTier::write(Job& job) {
     e.at = now_();
     const uint64_t b = e.chunked ? e.written_bytes : e.bytes;
     const size_t nfiles = e.files.size();
-    const std::string note = e.chunk_note;
+    const std::string note = e.chunk_note + (as_of > 0 ? skip_note(tokens, as_of) : std::string());
     std::string tail;
     {
         std::lock_guard<std::mutex> lock(m_);
+        if (as_of > 0) { ++stats_.live_skipped; stats_.live_skipped_tokens += tokens - (size_t) as_of; }
         ++stats_.written;
         stats_.bytes_written += b;
         stats_.write_ms += ms;
@@ -903,16 +940,26 @@ void ConversationDiskTier::write(Job& job) {
 
 bool ConversationDiskTier::write_now(const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                                      const std::function<bool()>& cancel, uint64_t& id, std::string& error,
-                                     bool* cancelled) {
+                                     bool* cancelled, bool background, int64_t* as_of_out) {
     id = 0;
     if (cancelled) *cancelled = false;
+    if (as_of_out) *as_of_out = 0;
     if (!open_) { error = "the disk tier is off"; return false; }
     Entry e;
+    const int64_t as_of = live_skip_tokens(image, background);   // the keys are those of the image that is written
+    if (as_of_out) *as_of_out = as_of;
     e.live = key_of(image.live);
     for (const auto& c : image.checkpoints) e.checkpoints.push_back(key_of(c));
+    if (as_of > 0) {
+        e.checkpoints.clear();
+        for (const auto& c : image.checkpoints) {
+            if ((int64_t) c.ids.size() < as_of) e.checkpoints.push_back(key_of(c));
+            else if ((int64_t) c.ids.size() == as_of) { e.live = key_of(c); e.checkpoints.push_back(key_of(c)); }
+        }
+    }
     e.cvec = image.cvec;
     const uint64_t estimate = image.bytes() + sources_bytes(sources);
-    const size_t tokens = e.live.ids.size();
+    const size_t tokens = image.live.ids.size();
     {
         std::lock_guard<std::mutex> lock(m_);
         // already there with exactly these keys: nothing to write
@@ -935,7 +982,7 @@ bool ConversationDiskTier::write_now(const SavedConversation& image, const std::
         if (cancel && cancel()) { was_cancelled = true; return true; }
         return false;
     };
-    const bool ok = write_files(e, image, sources, ask, error);
+    const bool ok = write_files(e, image, sources, ask, error, false, as_of);
     const double ms = ms_since(t0);
     if (!ok) {
         std::lock_guard<std::mutex> lock(m_);
@@ -948,10 +995,11 @@ bool ConversationDiskTier::write_now(const SavedConversation& image, const std::
     e.at = now_();
     const uint64_t b = e.chunked ? e.written_bytes : e.bytes;
     const size_t nfiles = e.files.size();
-    const std::string note = e.chunk_note;
+    const std::string note = e.chunk_note + (as_of > 0 ? skip_note(tokens, as_of) : std::string());
     std::string tail;
     {
         std::lock_guard<std::mutex> lock(m_);
+        if (as_of > 0) { ++stats_.live_skipped; stats_.live_skipped_tokens += tokens - (size_t) as_of; }
         ++stats_.synced;
         stats_.bytes_written += b;
         stats_.write_ms += ms;
@@ -1026,7 +1074,7 @@ void ConversationDiskTier::set_busy(bool busy) {
 }
 
 bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
-                                const std::function<bool(uint64_t, std::string&)>& admit, bool keep) {
+                                const std::function<bool(uint64_t, std::string&)>& admit, bool keep, int64_t upto) {
     out = SavedConversation{};
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_);
@@ -1060,8 +1108,23 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         error = "the entry is gone (its write failed, or it expired)";
         return false;
     }
+    // A write cut at a checkpoint (live-skip) rewrites the keys of an entry that best() reported with its full live
+    // state: the image on the disk then holds fewer tokens than the match said, and a request that resumes at the
+    // match would run past the restored K/V.  A miss - the entry stays, as the checkpoint it is.
+    if (tokens > (int64_t) entries_[index].live.ids.size()) {
+        error = fmt("the entry holds %zu tokens, fewer than the %lld matched (written as of a checkpoint)",
+                    entries_[index].live.ids.size(), (long long) tokens);
+        lock.unlock();
+        log(fmt("disk miss: %s", error.c_str()));
+        return false;
+    }
     const Entry want = entries_[index];
     const std::vector<std::string>& files = want.files;
+    // a prefix read: the request reuses a checkpoint shorter than the entry's live state (chunked entries, kept)
+    int64_t cut = 0;
+    if (keep && upto > 0 && want.chunked && pool_ && files.size() == 1 && upto < (int64_t) want.live.ids.size())
+        for (const auto& c : want.checkpoints)
+            if ((int64_t) c.ids.size() == upto) cut = upto;
     // the chunks stay pinned while they are read: the entry leaves the list now and drops its references, but a pinned
     // chunk is never swept; after the read the pins go and the chunks wait out their grace (a continuation of this
     // conversation is written next and hits them)
@@ -1091,7 +1154,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         size_t n = 0;
         if (want.chunked && pool_) {
             uint64_t raw = 0;
-            ok = chunked_read(*pool_, files[k], fid, part, n, raw, error, limits, ChunkedReadOptions{0, options_.io_workers});
+            ok = chunked_read(*pool_, files[k], fid, part, n, raw, error, limits, ChunkedReadOptions{cut, options_.io_workers});
             bytes += raw;
         } else {
             ok = session_file_read(files[k], fid, part, n, error, limits);
@@ -1101,7 +1164,16 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         if (k == 0) out = std::move(part);
         else out.stage_images.push_back(std::move(part));
     }
-    if (ok && !holds(out, want.live, want.checkpoints, want.cvec)) {
+    // a prefix image holds the checkpoint it was cut at as its live state, and the checkpoints up to it
+    ConversationCheckpoint want_live = want.live;
+    std::vector<ConversationCheckpoint> want_checks = want.checkpoints;
+    if (cut > 0) {
+        want_checks.clear();
+        for (const auto& c : want.checkpoints)
+            if ((int64_t) c.ids.size() < cut) want_checks.push_back(c);
+            else if ((int64_t) c.ids.size() == cut) { want_live = c; want_checks.push_back(c); }
+    }
+    if (ok && !holds(out, want_live, want_checks, want.cvec)) {
         ok = false;
         error = "the files hold another conversation than their index";
     }
@@ -1126,12 +1198,14 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     ++stats_.disk_hits;
     if (keep) ++stats_.kept;
     stats_.bytes_read += bytes;
+    if (cut > 0) { ++stats_.prefix_reads; stats_.prefix_raw_bytes += bytes; }
     stats_.read_ms += ms - waited;
     stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
     lock.unlock();
-    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s%s", (long long) tokens, mib(bytes),
+    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s%s%s", (long long) tokens, mib(bytes),
             files.size(), files.size() == 1 ? "" : "s", ms - waited, mbps(bytes, ms - waited),
             waited > 0 ? fmt(", after %.0f ms waiting for its write", waited).c_str() : "",
+            cut > 0 ? fmt("; prefix read of %lld of %zu tokens", (long long) cut, want.live.ids.size()).c_str() : "",
             keep ? "; kept on the disk" : ""));
     log(summary());
     return true;
@@ -1199,7 +1273,10 @@ std::string ConversationDiskTier::summary() const {
             "pool %zu (%.0f MiB), %s I/O",
             (unsigned long long) s.chunks_new, (unsigned long long) s.chunks_hit, mib(s.new_file_bytes),
             mib(s.dedup_bytes), mib(s.raw_bytes), (unsigned long long) s.chunks_swept, mib(s.swept_bytes), pool_->count(),
-            mib(pool_->bytes()), s.direct_io ? "direct" : "buffered");
+            mib(pool_->bytes()), s.direct_io ? "direct" : "buffered") +
+        fmt("; %llu prefix reads (%.0f MiB), %llu writes as of a checkpoint (%llu tokens left out)",
+            (unsigned long long) s.prefix_reads, mib(s.prefix_raw_bytes), (unsigned long long) s.live_skipped,
+            (unsigned long long) s.live_skipped_tokens);
     return fmt("totals: %zu queued, %zu written + %zu saved while idle (%.0f MiB, %.0f MB/s; %zu given way to a "
                "request), %zu RAM hits, %zu disk hits (%zu kept; %.0f MiB, %.0f MB/s), %llu prompt tokens given back, "
                "%zu waits for RAM (%.0f ms), %zu expired, %zu removed for the budget, %zu superseded, %zu/%zu "
@@ -1209,6 +1286,19 @@ std::string ConversationDiskTier::summary() const {
                (unsigned long long) s.tokens_back, s.waits, s.wait_ms, s.expired, s.evicted, s.superseded,
                s.write_failed, s.read_failed, entries_.size(), mib(bytes_ + pool_bytes_all()),
                queue_.size() + (writing_ ? 1 : 0), chunks.c_str());
+}
+
+bool conversation_disk_skip_live(LivePolicy policy, int64_t live_tokens, int64_t deepest, int64_t gap) {
+    if (policy == LivePolicy::always) return false;
+    return deepest > 0 && deepest < live_tokens && live_tokens - deepest <= std::max<int64_t>(gap, 0);
+}
+
+bool conversation_disk_parse_live(const std::string& text, LivePolicy& policy, std::string& error) {
+    if (text == "always") { policy = LivePolicy::always; return true; }
+    if (text == "skip") { policy = LivePolicy::skip; return true; }
+    if (text == "auto") { policy = LivePolicy::automatic; return true; }
+    error = "the live policy is always, skip or auto";
+    return false;
 }
 
 bool conversation_disk_parse_codec(const std::string& text, ChunkCodec& codec, int& level, std::string& error) {

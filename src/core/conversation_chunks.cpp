@@ -980,6 +980,36 @@ uint64_t inline_bytes_of(const ConversationCheckpoint& c) {
                    sat_add(sat_add(c.ple.size(), c.tails.size()), sat_add(c.dead.size(), c.block_pos.size())));
 }
 
+// The pooled index's block: a pooled row covers this many tokens (the slab cut and the spare row are in these terms).
+constexpr int64_t kIdxBlock = 4;
+
+// The layer `g` of an image of `n` tokens as it is for the first `upto` tokens (0 < upto < n): the cells up to the page
+// that holds token upto-1, the pooled rows up to the spare row of `upto` (rows [0, upto/4) are the prefix of the full
+// image's rows, the spare row is not in the image: it comes from the checkpoint at `upto`).  Every part is linear in
+// the cells (or rows), so the prefix's bytes are the first bytes of the full image's, part by part - the same
+// transformation serves the prefix read and the write "as of a checkpoint" (live-skip).
+bool prefix_layer(const LayerGeom& g, int64_t n, int64_t upto, LayerGeom& out, std::string& why) {
+    if (upto < 1 || upto >= n) { why = "prefix length outside the image"; return false; }
+    if (g.page_size <= 0 || g.cells <= 0) { why = "K/V layer without cells"; return false; }
+    const int64_t page = g.page_size;
+    if (upto > INT64_MAX - page) { why = "prefix length overflow"; return false; }
+    const int64_t cells = (upto + page - 1) / page * page;
+    if (cells > g.cells) { why = "prefix is beyond the layer's cells"; return false; }
+    out = g;
+    out.cells = cells;
+    for (size_t part = 0; part < 4; ++part) {
+        if (g.sizes[part] % (uint64_t) g.cells) { why = "K/V part size is not a whole number of cells"; return false; }
+        out.sizes[part] = g.sizes[part] / (uint64_t) g.cells * (uint64_t) cells;
+    }
+    if (g.pooled_rows > 0) {
+        if (g.pooled_rows != n / kIdxBlock + 1) { why = "pooled rows do not match the token count"; return false; }
+        if (g.sizes[4] % (uint64_t) g.pooled_rows) { why = "pooled part size is not a whole number of rows"; return false; }
+        out.pooled_rows = upto / kIdxBlock + 1;
+        out.sizes[4] = g.sizes[4] / (uint64_t) g.pooled_rows * (uint64_t) out.pooled_rows;
+    }
+    return true;
+}
+
 bool has_stage_parts(const SavedConversation& s) {
     if (!s.live.stage_parts.empty()) return true;
     for (const auto& c : s.checkpoints) if (!c.stage_parts.empty()) return true;
@@ -1007,12 +1037,12 @@ public:
     std::vector<uint8_t> b;
 };
 
-void put_checkpoint(Wr& w, const ConversationCheckpoint& c, const CkptMeta& m) {
+void put_checkpoint(Wr& w, const ConversationCheckpoint& c, const CkptMeta& m, bool zero_used = false) {
     w.vec(c.ids);
     w.u64(c.imgs.size());
     for (const auto& k : c.imgs) { w.i64(k.start); w.u64(k.hash); }
     w.vec(c.ple); w.vec(c.tails); w.vec(c.dead); w.vec(c.block_pos);
-    w.u64(c.used);
+    w.u64(zero_used ? 0 : c.used);
     w.u64(m.gdn_len);
     w.u32(m.slice_len);
     w.u32(m.n_slices);
@@ -1302,12 +1332,36 @@ bool write_impl(ChunkPool& pool, const std::string& path, const SavedConversatio
             plan.L.push_back(g);
         }
     }
+    // "as of a checkpoint" (live-skip): the image written is the one of `as_of_tokens` tokens - the checkpoint of exactly
+    // that length is the live state, the shallower checkpoints stay, the K/V is cut to those tokens (a prefix of every
+    // part, so the source is read from offset 0 as before) and the spare pooled rows come from the checkpoint's `dead`
+    std::vector<const ConversationCheckpoint*> cps;
+    bool as_of = false;
+    if (opt.as_of_tokens > 0) {
+        const int64_t n = (int64_t) image.live.ids.size();
+        const ConversationCheckpoint* at = nullptr;
+        for (const auto& c : image.checkpoints) if ((int64_t) c.ids.size() == opt.as_of_tokens) at = &c;
+        if (at == nullptr || opt.as_of_tokens >= n ||
+            !std::equal(at->ids.begin(), at->ids.end(), image.live.ids.begin())) {
+            error = "chunked session: no checkpoint of " + std::to_string(opt.as_of_tokens) + " tokens leads the live state";
+            return false;
+        }
+        for (auto& g : plan.L) {
+            LayerGeom cut;
+            std::string why;
+            if (!prefix_layer(g, n, opt.as_of_tokens, cut, why)) { error = "chunked session: " + why; return false; }
+            g = cut;
+        }
+        as_of = true;
+        cps.push_back(at);
+        for (const auto& c : image.checkpoints) if ((int64_t) c.ids.size() <= opt.as_of_tokens) cps.push_back(&c);
+    } else {
+        cps.push_back(&image.live);
+        for (const auto& c : image.checkpoints) cps.push_back(&c);
+    }
     if (!plan.build(error)) return false;
     for (uint64_t i = 0; i < plan.n_slabs; ++i)
         if (plan.slab_len(i) > kMaxChunkRaw) { error = "chunked session: a slab is over the chunk limit; use fewer chunk_tokens"; return false; }
-
-    std::vector<const ConversationCheckpoint*> cps{&image.live};
-    for (const auto& c : image.checkpoints) cps.push_back(&c);
     std::vector<CkptMeta> metas(cps.size());
     uint64_t raw_total = plan.kv_total, chunk_raw_total = plan.kv_total;
     for (size_t l = 0; l < plan.L.size(); ++l)
@@ -1548,12 +1602,22 @@ bool write_impl(ChunkPool& pool, const std::string& path, const SavedConversatio
 
     // spare pooled rows
     std::vector<std::vector<uint8_t>> spare(plan.L.size());
+    size_t n_index_layers = 0, index_layer = 0;
+    for (const auto& g : plan.L) if (g.pooled_rows > 0) ++n_index_layers;
     for (size_t l = 0; l < plan.L.size(); ++l) {
         if (plan.L[l].pooled_rows == 0) continue;
         spare[l].resize((size_t) plan.row[l]);
         const uint64_t off = plan.data_rows[l] * plan.row[l];
         bool got = true;
-        if (plan.row[l]) {
+        if (as_of) {   // the checkpoint's own row (what its restore writes there)
+            const auto& dead = cps[0]->dead;
+            if (plan.row[l] && (n_index_layers == 0 || dead.size() != n_index_layers * plan.row[l])) {
+                error = "chunked session: the checkpoint's indexer rows do not fit the layers";
+                return false;
+            }
+            if (plan.row[l]) std::memcpy(spare[l].data(), dead.data() + index_layer * plan.row[l], (size_t) plan.row[l]);
+            ++index_layer;
+        } else if (plan.row[l]) {
             if (sources) got = (*sources)[l].read && (*sources)[l].read(4, (size_t) off, spare[l].data(), spare[l].size());
             else got = image.kv[l].pooled.read(spare[l].data(), (size_t) off, spare[l].size());
         }
@@ -1576,9 +1640,9 @@ bool write_impl(ChunkPool& pool, const std::string& path, const SavedConversatio
     }
     w.u32((uint32_t) slabs.size());
     for (const auto& r : slabs) w.ref(r);
-    put_checkpoint(w, image.live, metas[0]);
-    w.u64(image.checkpoints.size());
-    for (size_t i = 0; i < image.checkpoints.size(); ++i) put_checkpoint(w, image.checkpoints[i], metas[i + 1]);
+    put_checkpoint(w, *cps[0], metas[0], as_of);   // (as of a checkpoint: its copy as the live state has no use count, as in the prefix read)
+    w.u64(cps.size() - 1);
+    for (size_t i = 1; i < cps.size(); ++i) put_checkpoint(w, *cps[i], metas[i]);
 
     std::vector<uint8_t> file(kHeader);
     manifest_header(file.data(), id, w.b.size(), plan.T, raw_total);
@@ -1682,7 +1746,8 @@ struct Loaded {
 // the manifest: file checks, header, identity, trailer, then the bounded parse.  `admit` is asked (once) after the
 // body is parsed (its largest chunk sizes the buffers) and before anything the image needs is allocated.
 bool load_manifest(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
-                   bool skip_inline, int workers, Loaded& out, std::string& error, SessionStatus& st) {
+                   bool skip_inline, int workers, Loaded& out, std::string& error, SessionStatus& st,
+                   bool defer_admit = false) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;
@@ -1728,7 +1793,7 @@ bool load_manifest(const std::string& path, const SessionFileIdentity& id, const
     const uint8_t* tr = body + body_len;
     if (get_le<uint64_t>(tr) != session_hash64(body, (size_t) body_len, 0)) { error = "chunked session: body checksum mismatch"; return false; }
     if (std::memcmp(tr + 8, kManEnd, 8) != 0) { error = "chunked session: bad end marker"; return false; }
-    if (!skip_inline) {
+    if (!skip_inline && !defer_admit) {   // (defer: a prefix read asks for the size of the prefix it builds)
         const uint64_t cap = session_read_max_file_bytes(limits);
         if (raw_total > cap || raw_total > (uint64_t) std::numeric_limits<size_t>::max()) {
             error = "chunked session: image size " + std::to_string(raw_total) + " exceeds this engine's limit";
@@ -1738,7 +1803,7 @@ bool load_manifest(const std::string& path, const SessionFileIdentity& id, const
     Parsed parsed;
     if (!parse_body(body, (size_t) body_len, T, limits, skip_inline, parsed, error)) return false;
     if (parsed.raw_total != raw_total) { error = "chunked session: the image size in the header does not match the body"; return false; }
-    if (!skip_inline && limits.admit) {
+    if (!skip_inline && !defer_admit && limits.admit) {
         // asked once, with the manifest's own largest chunk (the parse is bounded by the limits and kMaxManifest)
         uint64_t max_raw = 0;
         for (const auto& r : parsed.slabs) max_raw = std::max<uint64_t>(max_raw, r.raw_len);
@@ -1760,26 +1825,107 @@ bool load_manifest(const std::string& path, const SessionFileIdentity& id, const
 bool read_impl(ChunkPool& pool, const std::string& path, const SessionFileIdentity& id, SavedConversation& out,
                size_t& manifest_bytes, uint64_t& raw_bytes_read, std::string& error, const SessionReadLimits& limits,
                const ChunkedReadOptions& opt, SessionStatus& st) {
-    if (opt.upto > 0) { st = {}; st.error = SessionError::invalid; error = "chunked session: prefix reads are not supported yet"; return false; }
     raw_bytes_read = 0;
     Loaded ld;
-    if (!load_manifest(path, id, limits, false, opt.workers, ld, error, st)) return false;
+    // the admission is asked below, once the size of what is built is known (a prefix is smaller than the file's image)
+    if (!load_manifest(path, id, limits, false, opt.workers, ld, error, st, true)) return false;
     st.error = SessionError::invalid;
     Parsed& p = ld.p;
+    auto fail_invalid = [&](const std::string& m) { error = "chunked session: " + m; return false; };
+
+    // the image's extent: the whole of it, or the prefix of `cut` tokens
+    const int64_t n_live = (int64_t) p.s.live.ids.size();
+    int64_t cut = 0;
+    if (opt.upto < 0) return fail_invalid("negative prefix length");
+    if (opt.upto > n_live) return fail_invalid("the prefix is longer than the image");
+    if (opt.upto > 0 && opt.upto < n_live) cut = opt.upto;
+    Plan pp = p.plan;                       // the plan of the image built (the manifest's for a whole read)
+    std::vector<size_t> kept;               // the manifest's checkpoints (index in p.cps, >= 1) the image carries
+    size_t chosen = 0;                      // prefix: its position in `kept`
+    if (cut > 0) {
+        bool found = false;
+        for (size_t i = 1; i < p.cps.size(); ++i) {
+            const auto& c = p.s.checkpoints[i - 1];
+            if ((int64_t) c.ids.size() > cut) continue;
+            if (!std::equal(c.ids.begin(), c.ids.end(), p.s.live.ids.begin())) return fail_invalid("a checkpoint is not a prefix of the live state");
+            if ((int64_t) c.ids.size() == cut) { chosen = kept.size(); found = true; }
+            kept.push_back(i);
+        }
+        if (!found) return fail_invalid("no checkpoint of " + std::to_string(cut) + " tokens to read");
+        std::string why;
+        for (auto& g : pp.L) {
+            LayerGeom c;
+            if (!prefix_layer(g, n_live, cut, c, why)) return fail_invalid(why);
+            g = c;
+        }
+        if (!pp.build(error)) return false;
+    } else {
+        for (size_t i = 1; i < p.cps.size(); ++i) kept.push_back(i);
+    }
+    // the bytes that image holds (K/V, every kept checkpoint's state, and for a prefix the chosen one's twice: as the
+    // live state too), checked against the engine's limit and offered to the RAM gate
+    uint64_t image_raw = pp.kv_total;
+    for (size_t i : kept) image_raw = sat_add(image_raw, sat_add(p.cps[i].gdn_len, p.cps[i].inline_bytes));
+    if (cut > 0) {
+        const auto& m = p.cps[kept[chosen]];
+        image_raw = sat_add(image_raw, sat_add(m.gdn_len, m.inline_bytes));
+    } else {
+        image_raw = sat_add(image_raw, sat_add(p.cps[0].gdn_len, p.cps[0].inline_bytes));
+    }
+    if (image_raw > session_read_max_file_bytes(limits) || image_raw > (uint64_t) std::numeric_limits<size_t>::max())
+        return fail_invalid("image size " + std::to_string(image_raw) + " exceeds this engine's limit");
+    // the chunks to read: the slabs [0, pp.n_slabs) and the state slices of the kept checkpoints (and, whole, the live one)
+    std::vector<ChunkRef> refs(p.slabs.begin(), p.slabs.begin() + (std::ptrdiff_t) pp.n_slabs);
+    if (cut == 0) refs.insert(refs.end(), p.cps[0].refs.begin(), p.cps[0].refs.end());
+    for (size_t i : kept) refs.insert(refs.end(), p.cps[i].refs.begin(), p.cps[i].refs.end());
+    uint64_t max_raw = 0;
+    for (const auto& r : refs) max_raw = std::max<uint64_t>(max_raw, r.raw_len);
+    if (limits.admit) {
+        std::string why;
+        if (!limits.admit(chunked_read_peak_bytes(image_raw, opt.workers, ld.T, max_raw), why)) {
+            st.error = SessionError::memory;
+            error = "chunked session: " + why;
+            return false;
+        }
+    }
     // every chunk must exist before the image is allocated: the bytes the manifest claims are really on the disk
-    const std::vector<ChunkRef> refs = all_refs(p);
     for (const auto& r : refs)
         if (!pool.exists(r)) { error = "chunked session: chunk " + r.key.hex() + " is missing"; return false; }
 
     SavedConversation img = std::move(p.s);
     uint64_t done = 0;
-    const uint64_t total = refs.empty() ? 0 : [&] { uint64_t t = 0; for (const auto& r : refs) t += r.raw_len; return t; }();
-    for (size_t l = 0; l < img.kv.size(); ++l) {
-        auto& k = img.kv[l];
-        k.k.resize((size_t) p.plan.L[l].sizes[0]); k.v.resize((size_t) p.plan.L[l].sizes[1]);
-        k.k_scale.resize((size_t) p.plan.L[l].sizes[2]); k.v_scale.resize((size_t) p.plan.L[l].sizes[3]);
-        k.pooled.resize((size_t) p.plan.L[l].sizes[4]);
+    uint64_t total = 0;
+    for (const auto& r : refs) total += r.raw_len;
+    // the checkpoints of the image: whole, the manifest's (live apart); a prefix, the kept ones, and the chosen one is the live state
+    struct Target { ConversationCheckpoint* cp; size_t meta; };
+    std::vector<Target> targets;
+    {
+        std::vector<ConversationCheckpoint> all = std::move(img.checkpoints);
+        ConversationCheckpoint live0 = std::move(img.live);
+        img.checkpoints.clear();
+        for (size_t i : kept) img.checkpoints.push_back(std::move(all[i - 1]));
+        if (cut > 0) {
+            img.live = img.checkpoints[chosen];   // (its state is copied below, once the slices are in)
+            img.live.used = 0;
+        } else {
+            img.live = std::move(live0);
+        }
+        if (cut == 0) targets.push_back({&img.live, 0});
+        for (size_t k = 0; k < kept.size(); ++k) targets.push_back({&img.checkpoints[k], kept[k]});
     }
+    // K/V buffers: not zeroed (resize_for_overwrite); the coverage count below is the proof that every byte was written
+    const size_t n_layers = img.kv.size();
+    for (size_t l = 0; l < n_layers; ++l) {
+        auto& k = img.kv[l];
+        const auto& g = pp.L[l];
+        k.cells = g.cells;
+        k.pooled_rows = g.pooled_rows;
+        k.k.resize_for_overwrite((size_t) g.sizes[0]); k.v.resize_for_overwrite((size_t) g.sizes[1]);
+        k.k_scale.resize_for_overwrite((size_t) g.sizes[2]); k.v_scale.resize_for_overwrite((size_t) g.sizes[3]);
+        k.pooled.resize_for_overwrite((size_t) g.sizes[4]);
+    }
+    std::unique_ptr<std::atomic<uint64_t>[]> stored(new std::atomic<uint64_t>[n_layers * 5 + 1]);
+    for (size_t i = 0; i < n_layers * 5 + 1; ++i) stored[i] = 0;
     // The chunks are independent: workers fetch, verify and decode them (each into its own scratch, then into its own
     // disjoint range of the image), the first failure stops the rest.  The spare rows come from the manifest.
     std::mutex mu;
@@ -1800,19 +1946,18 @@ bool read_impl(ChunkPool& pool, const std::string& path, const SessionFileIdenti
         if (limits.progress) limits.progress(done, total);
         return true;
     };
-    struct Task { size_t cp = 0; uint32_t j = 0; };   // cp = SIZE_MAX: a K/V slab, j = its index
+    struct Task { size_t target = 0; uint32_t j = 0; };   // target = SIZE_MAX: a K/V slab, j = its index
     std::vector<Task> tasks;
-    for (uint64_t i = 0; i < p.plan.n_slabs; ++i) tasks.push_back({SIZE_MAX, (uint32_t) i});
-    for (size_t i = 0; i < p.cps.size(); ++i) {
-        ConversationCheckpoint& cp = i == 0 ? img.live : img.checkpoints[i - 1];
-        cp.gdn.resize((size_t) p.cps[i].gdn_len);
-        for (uint32_t j = 0; j < p.cps[i].n_slices; ++j) tasks.push_back({i, j});
+    for (uint64_t i = 0; i < pp.n_slabs; ++i) tasks.push_back({SIZE_MAX, (uint32_t) i});
+    for (size_t t = 0; t < targets.size(); ++t) {
+        targets[t].cp->gdn.resize((size_t) p.cps[targets[t].meta].gdn_len);
+        for (uint32_t j = 0; j < p.cps[targets[t].meta].n_slices; ++j) tasks.push_back({t, j});
     }
     auto run = [&](const Task& t, std::vector<uint8_t>& scratch) {
         try {
-            if (t.cp != SIZE_MAX) {
-                ConversationCheckpoint& cp = t.cp == 0 ? img.live : img.checkpoints[t.cp - 1];
-                const CkptMeta& m = p.cps[t.cp];
+            if (t.target != SIZE_MAX) {
+                ConversationCheckpoint& cp = *targets[t.target].cp;
+                const CkptMeta& m = p.cps[targets[t.target].meta];
                 const size_t off = (size_t) t.j * m.slice_len;
                 get(ChunkKind::state_slice, m.refs[t.j], cp.gdn.data() + off, cp.gdn.size() - off);
                 return;
@@ -1823,14 +1968,18 @@ bool read_impl(ChunkPool& pool, const std::string& path, const SessionFileIdenti
             if (!get(ChunkKind::kv_slab, r, scratch.data(), scratch.size())) return;
             size_t at = 0;
             for (size_t part = 0; part < 5; ++part)
-                for (size_t l = 0; l < img.kv.size(); ++l) {
-                    uint64_t off, n;
-                    p.plan.slice(l, part, i, off, n);
-                    if (!n) continue;
-                    auto& k = img.kv[l];
-                    ConversationBuffer* b[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
-                    if (!write_buffer_at(*b[part], off, scratch.data() + at, n)) { fail(SessionError::invalid, "chunked session: slab does not fit its part"); return; }
-                    at += (size_t) n;
+                for (size_t l = 0; l < n_layers; ++l) {
+                    uint64_t off, full, n;
+                    p.plan.slice(l, part, i, off, full);   // what the chunk carries
+                    if (!full) continue;
+                    pp.slice(l, part, i, off, n);          // what the image wants of it (a prefix: the head)
+                    if (n) {
+                        auto& k = img.kv[l];
+                        ConversationBuffer* b[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                        if (!write_buffer_at(*b[part], off, scratch.data() + at, n)) { fail(SessionError::invalid, "chunked session: slab does not fit its part"); return; }
+                        stored[l * 5 + part] += n;
+                    }
+                    at += (size_t) full;
                 }
         } catch (const std::bad_alloc&) {
             fail(SessionError::memory, "chunked session: out of memory while reading a chunk");
@@ -1862,12 +2011,35 @@ bool read_impl(ChunkPool& pool, const std::string& path, const SessionFileIdenti
         for (auto& t : threads) t.join();
     }
     if (failed) { st.error = first_kind; error = first_error; return false; }
-    for (size_t l = 0; l < img.kv.size(); ++l)
-        if (!p.spare[l].empty() &&
-            !write_buffer_at(img.kv[l].pooled, p.plan.data_rows[l] * p.plan.row[l], p.spare[l].data(), p.spare[l].size())) {
-            error = "chunked session: the spare row does not fit";
-            return false;
+    // the spare rows: the manifest's (whole), or for a prefix the chosen checkpoint's `dead` (what its restore writes there)
+    {
+        size_t index_layer = 0, n_index = 0;
+        for (const auto& g : pp.L) if (g.pooled_rows > 0) ++n_index;
+        const auto& dead = img.live.dead;
+        for (size_t l = 0; l < n_layers; ++l) {
+            if (pp.L[l].pooled_rows == 0) continue;
+            const uint64_t row = pp.row[l], off = pp.data_rows[l] * row;
+            const uint8_t* src = p.spare[l].data();
+            size_t len = p.spare[l].size();
+            if (cut > 0) {
+                if (row && dead.size() != n_index * row) return fail_invalid("the checkpoint's indexer rows do not fit the layers");
+                src = dead.data() + index_layer * row;
+                len = (size_t) row;
+            }
+            ++index_layer;
+            if (len && !write_buffer_at(img.kv[l].pooled, off, src, len)) return fail_invalid("the spare row does not fit");
+            stored[l * 5 + 4] += len;
         }
+    }
+    // The coverage proof for resize_for_overwrite: the slices are disjoint by construction, so a part whose stored bytes add up
+    // to its size has every byte written; any other count means the manifest's slabs did not cover the geometry.
+    for (size_t l = 0; l < n_layers; ++l)
+        for (size_t part = 0; part < 5; ++part)
+            if (stored[l * 5 + part] != pp.L[l].sizes[part])
+                return fail_invalid("the slabs do not cover K/V layer " + std::to_string(l) + " part " + std::to_string(part));
+    if (cut > 0) {   // the chosen checkpoint is the live state too
+        img.live.gdn = img.checkpoints[chosen].gdn;
+    }
     out = std::move(img);
     manifest_bytes = (size_t) ld.file_bytes;
     st.error = SessionError::none;

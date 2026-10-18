@@ -35,6 +35,22 @@
 
 namespace strata::core {
 
+/// --conversation-disk-live (chunked format only): whether the live state of a conversation is written along with its
+/// checkpoints.  The live state is the deepest point the conversation reached (its K/V and a running state of ~118 MB);
+/// a checkpoint within a few thousand tokens of it resumes the same conversation after re-reading only that gap.
+///   always: always written (the default, as before);
+///   skip:   not written when a checkpoint lies within `live_gap` tokens of it - the image is written "as of" the
+///           deepest checkpoint (its K/V cut to that point, no live running state);
+///   auto:   skip, but only for background writes (the RAM cache's evictions, the idle save) - never for the writes of
+///           RAM pressure and of the QUIT-time save, which keep every token they can.
+enum class LivePolicy { always, skip, automatic };
+/// Pure policy: true when a write with `policy` should drop the live state, given the live state's tokens and the
+/// deepest checkpoint's (0 = none).  No checkpoint, or none behind the live state: false.  `auto` is `skip` here: the
+/// caller (the tier) passes `always` for a write that must not skip.
+bool conversation_disk_skip_live(LivePolicy policy, int64_t live_tokens, int64_t deepest_checkpoint_tokens, int64_t gap);
+/// "always", "skip" or "auto".  False + `error` otherwise.
+bool conversation_disk_parse_live(const std::string& text, LivePolicy& policy, std::string& error);
+
 struct ConversationDiskOptions {
     std::string dir;                 ///< empty: the tier is off
     uint64_t budget_bytes = 0;       ///< at most this many bytes of files; 0: off
@@ -54,6 +70,8 @@ struct ConversationDiskOptions {
     ChunkCodec codec = ChunkCodec::raw;   ///< chunked: how chunks are stored (zstd falls back to raw when not built in)
     int codec_level = 1;             ///< chunked: the zstd level
     int io_workers = 2;              ///< chunked: threads of the chunk pipeline (hash, codec, write; parallel decode on read)
+    LivePolicy live_policy = LivePolicy::always;   ///< chunked: see LivePolicy
+    int64_t live_gap = 4096;         ///< chunked, skip/auto: the live state is dropped when a checkpoint is at most this many tokens behind it
     /// chunked, tests: seconds since the epoch for the chunks' grace periods (default: the system clock)
     std::function<int64_t()> wall_clock_s;
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
@@ -77,6 +95,8 @@ struct ConversationDiskStats {
     uint64_t raw_bytes = 0, dedup_bytes = 0, new_file_bytes = 0;   ///< K/V + state bytes seen; of them already stored; new chunk file bytes
     uint64_t chunks_swept = 0, swept_bytes = 0;                    ///< unreferenced chunks deleted
     bool direct_io = false;                                        ///< the last chunk write used O_DIRECT
+    uint64_t prefix_reads = 0, prefix_raw_bytes = 0;               ///< takes that read a prefix of the entry; the bytes they read
+    uint64_t live_skipped = 0, live_skipped_tokens = 0;            ///< writes made "as of" a checkpoint; the tokens they left out
 };
 
 /// --conversation-disk-codec: "raw" or "zstd" / "zstd:LEVEL" (1..19; plain "zstd" is level 1).  False + `error` otherwise.
@@ -139,8 +159,15 @@ public:
     /// `keep`: an entry on the disk stays there (its files are read, not removed) and becomes the newest - a request
     /// that borrows a sibling's prefix, or (persist) a resume point that must outlive a crash until a newer copy of
     /// the conversation is written.  A queued entry still leaves the queue (its RAM image is handed over).
+    ///
+    /// `upto` (chunked entries, with `keep`): the request reuses a checkpoint of exactly `upto` tokens, shorter than the
+    /// entry's live state: only the K/V and the running states up to that point are read (chunked_read's prefix image:
+    /// the checkpoint becomes the live state, the checkpoints of at most `upto` tokens stay).  The image `out` is then
+    /// `upto` tokens long and the engine restores it as any other.  Ignored (the whole entry is read) for a v1 entry, an
+    /// entry still queued, without `keep`, or when no checkpoint of that length is held.
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
-              const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {}, bool keep = false);
+              const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {}, bool keep = false,
+              int64_t upto = 0);
 
     /// Writes `image` NOW on the caller's thread (no queue), then registers it, makes room for the budget and removes
     /// the older entries it supersedes - in that order, so a crash at any point leaves at least one copy.  `sources`
@@ -148,8 +175,11 @@ public:
     /// streaming form; `image.kv` must then be empty).  `cancel` is asked before every 16 MiB block: true gives the
     /// write up (`*cancelled`, temporary files removed, nothing registered).  An entry with exactly these keys already
     /// on the disk is not written again: its id comes back.  `id` = the entry.  False with `error` on a failure.
+    /// `background`: a write that can give way (the idle save), not the QUIT-time save (LivePolicy::automatic).
+    /// `as_of_out`: the tokens of the checkpoint the entry was written as of (live-skip), 0 when it holds the whole live state.
     bool write_now(const SavedConversation& image, const std::vector<SessionKvSource>* sources,
-                   const std::function<bool()>& cancel, uint64_t& id, std::string& error, bool* cancelled = nullptr);
+                   const std::function<bool()>& cancel, uint64_t& id, std::string& error, bool* cancelled = nullptr,
+                   bool background = false, int64_t* as_of_out = nullptr);
     /// Whether entry `id` is on the disk (or queued / being written).
     bool has(uint64_t id) const;
     /// `shared`: the entries other engines published since the last look come in (their index files), and the ones
@@ -204,7 +234,10 @@ private:
     void write(Job& job);                                    // without the lock
     // the files of `img` (one per stage) under entry `e`'s id; `sources`: stage 0's K/V streamed; without the lock
     bool write_files(Entry& e, const SavedConversation& img, const std::vector<SessionKvSource>* sources,
-                     const std::function<bool()>& cancel, std::string& error, bool flush = false);
+                     const std::function<bool()>& cancel, std::string& error, bool flush = false, int64_t as_of = 0);
+    // live-skip: the tokens of the checkpoint `img` is written "as of" (0: written whole); a background write can skip
+    // under `automatic`, the others only under `skip`
+    int64_t live_skip_tokens(const SavedConversation& img, bool background) const;
     // a written entry joins the list: the budget and the entries it supersedes go after it (m_ held); log part back
     std::string publish_locked(Entry&& e, size_t& made_room, size_t& dropped);
     void remove_locked(size_t index, bool delete_files);     // m_ held
