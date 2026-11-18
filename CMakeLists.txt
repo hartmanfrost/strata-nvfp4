@@ -292,6 +292,12 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(conversation_chunks_test PRIVATE include)
   target_link_libraries(conversation_chunks_test PRIVATE Threads::Threads ${_strata_zstd_link})
   add_test(NAME conversation_chunks_test COMMAND conversation_chunks_test)
+  # offline measurement of a parked image (sections, zstd ratios, dedup between two images); the selftest generates its own files
+  add_executable(conversation_measure src/core/conversation_measure.cpp src/core/conversation_chunks.cpp
+                 src/core/conversation_codec.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_measure PRIVATE include)
+  target_link_libraries(conversation_measure PRIVATE Threads::Threads ${_strata_zstd_link})
+  add_test(NAME conversation_measure_selftest COMMAND conversation_measure selftest)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
