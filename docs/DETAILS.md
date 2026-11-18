@@ -1677,6 +1677,43 @@ conversation (the prompt matches the turn's checkpoint, not the live end) and dr
 later. The tokens are the same: parking is a cache. A request that leaves more than N tokens behind (another
 conversation on the shared system prompt) parks as before; a borrow (above) never counts as one.
 
+`STRATA_CONV_KEY_MIN_SHARED=N` (opt-in, N > 0; off when unset, 0 or not a plain number; this fork, needs the server's
+`prompt_cache_key` below): a client that rewrites its own history (a compaction, a prune of old tool results, a rewind to
+an earlier turn) sends a prompt that shares only a short prefix with the live session, so the session is parked as if
+another conversation were interleaved with it - copied to the host, evicted on to the disk tier - although nothing will
+continue that branch. Only the client knows. The chat completions route (`/v1/chat/completions`) reads the standard
+OpenAI field `prompt_cache_key` (a string; agent clients can send their session id there), but only from a
+client that opts in with the request header `X-Strata-Conv-Scope: <its own name>`: the header says the key is one
+conversation's id, unique per conversation, its requests in order. The OpenAI API defines the field as a cache-routing
+bucket only, and many clients send one static key per user, per app or per feature; two chats of such a client that
+share a long system prompt would look like one conversation rewriting itself and drop each other's cache in turn, so
+without the header the key is ignored. The server passes a 64-bit hash of the key, keyed by the scope (two clients with
+the same key string never share a conversation), to the engine as `conv=<16 hex>` on the GEN line; `/v1/responses` and
+`/v1/messages` never send it, header or not (Codex gives its sub-agents the parent's key), and a client cannot set the
+internal field. A client that keys its requests by session sends both: `prompt_cache_key: <session id>` in the body and
+`X-Strata-Conv-Scope: <client name>` as a header. The engine remembers the key of the request
+that left the live session. A request with the same key that does not continue the live session and shares N tokens or
+more with it (N = 1024 is a good value) has rewritten it: the session is not parked, so not written to the disk tier
+either. Everything else parks as before: no key, another key (a sub-agent, a fork), the same key with fewer than N
+shared tokens (a title request with its own system prompt), a request that continues the session, a `--batch` slot, a
+prompt or session with pictures, another control vector. A hint only ever cancels a park: a restore still needs the exact
+token prefix, so a wrong key costs a conversation read again and never changes an output. The price is the old branch
+as a donor: a later request that shares only part of it reads that part again. Logged: `conversation cache: dropped
+superseded conversation (same conv key, N shared tokens of its M) - not parked, not written to the disk tier;
+dropped_superseded=C` (C counts since the start; also `dropped_superseded` in `/metrics` `conversation_cache`), and for a
+keyed request that parks as before `conversation cache: conv key does not supersede the outgoing conversation (why); it
+parks as before`; one line at start says the rule is on. The variable is read once, when the engine starts: set it in the
+container's `environment:` or in the config's `"env"` block (the config wins), then restart. A copy of the live session
+that `--conversation-disk-sync-s` already wrote to the disk before the rewriting request arrived stays there. With a
+request that borrows a parked conversation's checkpoint (above), the K/V the engine retained from an earlier restore is
+dropped before the borrowed prefix overwrites the session (`conversation cache: retained K/V of N tokens dropped: a
+borrowed prefix replaces the session's K/V`); the park of the outgoing session normally takes it first, so this happens
+only when no park ran - the rule above, a session not complete, one below `--conversation-cache-min-tokens` or one
+held back by `--conversation-cache-park-gain` - and without it the next park would have copied the old conversation's
+bytes for the prefix the two share (the one change with the rule off). Code, the truth table of the rule, a model of
+the serve loop around it and checks of its glue in `generate.cpp`: `include/strata/program/conv_key.hpp`,
+`src/program/conv_key_test.cpp`.
+
 The floor also holds after a park (this fork): before every command, between batch windows and every 2 s while the
 engine is idle, an available RAM below `--conversation-cache-min-free-mib` makes the cache give RAM back - the retained
 K/V first, then the parked conversations least recently active first (to the disk tier when one is set, as any

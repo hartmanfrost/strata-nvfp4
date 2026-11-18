@@ -1709,6 +1709,175 @@ class SamplingKeys(unittest.TestCase):
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
 
+class SamplingRecorder(MockEngine):
+    """Keeps the `sampling` dict of every request the service hands the engine (what StrataEngine.sampling_keys reads)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.samplings = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.samplings.append(dict(sampling or {}))
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class ConversationKeyHint(unittest.TestCase):
+    """The OpenAI `prompt_cache_key` becomes `conv=<16 hex>` on the engine's GEN line (a hint that lets the engine skip
+    parking a conversation the client has just rewritten itself; the engine only acts on it with
+    STRATA_CONV_KEY_MIN_SHARED set) - only for a client that opts in with the X-Strata-Conv-Scope header, whose value
+    namespaces the key.  Only the chat completions route sets it; no client can forge it."""
+
+    SCOPE = {"X-Strata-Conv-Scope": "my-agent"}
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = SamplingRecorder(tok, "</think>\n\nok", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body, headers=None):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code, e.read()
+
+    def conv_sent(self, path, body, headers=None):
+        """The `conv=` token the engine would be sent for this request (None: no such key), after a real round trip."""
+        n = len(self.engine.samplings)
+        status, raw = self.post(path, body, headers)
+        self.assertEqual(status, 200, raw[:300])
+        self.assertEqual(len(self.engine.samplings), n + 1)
+        toks = [t for t in StrataEngine.sampling_keys(self.engine.samplings[-1]).split() if t.startswith("conv=")]
+        self.assertLessEqual(len(toks), 1)
+        return toks[0] if toks else None
+
+    CHAT = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_the_key_is_a_stable_hash(self):
+        import hashlib
+        from serve.server import conv_key_of
+        sid = "8f14e45f-ceea-467a-9a36-dedd4bea2543"
+        a = conv_key_of(sid, "my-agent")
+        self.assertRegex(a, r"^[0-9a-f]{16}$")
+        self.assertEqual(a, conv_key_of(sid, "my-agent"))
+        salt = hashlib.blake2b(b"my-agent", digest_size=32).digest()
+        self.assertEqual(int(a, 16), int.from_bytes(hashlib.blake2b(sid.encode(), digest_size=8, key=salt).digest(),
+                                                    "little"))
+        self.assertNotEqual(a, conv_key_of("8f14e45f-ceea-467a-9a36-dedd4bea2544", "my-agent"))
+        self.assertEqual(a, conv_key_of(sid, "  my-agent "), "blanks around the scope do not matter")
+        for odd in ("a b", "line\nbreak", "ключ", " ", "x" * 100000, "\ud800"):   # nothing of the text reaches the protocol
+            self.assertRegex(conv_key_of(odd, "my-agent"), r"^[0-9a-f]{16}$", repr(odd[:20]))
+
+    def test_the_scope_namespaces_the_key(self):
+        """Two clients that happen to use the same key string never share a conversation."""
+        from serve.server import conv_key_of
+        self.assertNotEqual(conv_key_of("user-1", "my-agent"), conv_key_of("user-1", "other-app"))
+        self.assertNotEqual(conv_key_of("bc", "a"), conv_key_of("c", "ab"), "no concatenation ambiguity")
+
+    def test_no_key_for_what_is_not_a_key(self):
+        from serve.server import conv_key_of
+        for bad in (None, "", 5, 1.5, True, [], ["k"], {"k": 1}, b"k"):
+            self.assertIsNone(conv_key_of(bad, "my-agent"), repr(bad))
+        for no_scope in (None, "", "   ", 5, b"my-agent"):   # the client did not opt in: the key is a cache bucket, not an id
+            self.assertIsNone(conv_key_of("session-a", no_scope), repr(no_scope))
+
+    def test_a_hash_of_zero_is_not_zero(self):
+        """0 means "no key" to the engine, so the one input that would hash to it is sent as 1."""
+        from serve import server as srv
+
+        class Zero:
+            def digest(self):
+                return bytes(8)
+        with mock.patch.object(srv.hashlib, "blake2b", lambda *a, **kw: Zero()):
+            self.assertEqual(srv.conv_key_of("anything", "my-agent"), "0000000000000001")
+
+    def test_sampling_keys(self):
+        k = StrataEngine.sampling_keys
+        self.assertIn(" conv=5ee5a10cca7e0040", k({"_strata_conv": "5ee5a10cca7e0040"}))
+        base = k({"temperature": 0.7, "top_k": 10, "strata_checkpoint": False})
+        self.assertEqual(k({"temperature": 0.7, "top_k": 10, "strata_checkpoint": False, "prompt_cache_key": "x"}), base)
+        self.assertNotIn("conv=", base)                      # absent: the line is byte for byte what it was
+        for bad in ("", "zz", "5EE5A10CCA7E0040", "5ee5a10cca7e004", "5ee5a10cca7e00400", "5ee5a10cca7e004 ", "0x5ee5a10cca7e004",
+                    5, None, ["5ee5a10cca7e0040"]):
+            self.assertNotIn("conv=", k({"_strata_conv": bad}), repr(bad))
+
+    def test_chat_completions_sends_the_key(self):
+        from serve.server import conv_key_of
+        a = self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "session-a"}, self.SCOPE)
+        self.assertEqual(a, "conv=" + conv_key_of("session-a", "my-agent"))
+        self.assertEqual(a, self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "session-a",
+                                                                    "messages": [{"role": "user", "content": "again"}]},
+                                           self.SCOPE))
+        self.assertNotEqual(a, self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "session-b"},
+                                              self.SCOPE))
+        self.assertEqual(a, self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "session-a",
+                                                                    "stream": True}, self.SCOPE))
+        self.assertEqual(a, self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "session-a",
+                                                                    "prompt_cache_retention": "24h", "store": False},
+                                           self.SCOPE))
+        self.assertEqual(a, self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "session-a"},
+                                           {"x-strata-conv-scope": "my-agent"}), "the header's name is case-insensitive")
+        # another client with the same key string: another conversation
+        b = self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "session-a"},
+                           {"X-Strata-Conv-Scope": "other-app"})
+        self.assertIsNotNone(b)
+        self.assertNotEqual(a, b)
+
+    def test_a_key_without_the_opt_in_is_ignored(self):
+        """The hazard the header closes: an OpenAI client that sends one static prompt_cache_key for many chats (per user,
+        per app) must not have its chats treated as one conversation rewriting itself."""
+        for headers in (None, {"X-Strata-Conv-Scope": ""}, {"X-Strata-Conv-Scope": "  "}, {"X-Strata-Conv-Key": "my-agent"}):
+            self.assertIsNone(self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": "user-1"}, headers),
+                              repr(headers))
+            self.assertIsNone(self.conv_sent("/v1/chat/completions",
+                                             {**self.CHAT, "prompt_cache_key": "user-1",
+                                              "messages": [{"role": "user", "content": "another chat"}]}, headers),
+                              repr(headers))
+
+    def test_chat_completions_without_a_key(self):
+        self.assertIsNone(self.conv_sent("/v1/chat/completions", self.CHAT, self.SCOPE))
+        for bad in ("", 7, None, ["k"], {"k": "v"}, True):
+            self.assertIsNone(self.conv_sent("/v1/chat/completions", {**self.CHAT, "prompt_cache_key": bad}, self.SCOPE),
+                              repr(bad))
+
+    def test_a_client_cannot_forge_it(self):
+        from serve.server import conv_key_of
+        forged = "0123456789abcdef"
+        for headers in (None, self.SCOPE):
+            self.assertIsNone(self.conv_sent("/v1/chat/completions", {**self.CHAT, "_strata_conv": forged}, headers))
+            self.assertIsNone(self.conv_sent("/v1/chat/completions", {**self.CHAT, "_strata_conv": forged,
+                                                                      "prompt_cache_key": ""}, headers))
+            # the other routes never set it, and a forged one is dropped on them too
+            self.assertIsNone(self.conv_sent("/v1/messages", {**self.CHAT, "_strata_conv": forged}, headers))
+            self.assertIsNone(self.conv_sent("/v1/responses", {"model": "m", "max_output_tokens": 8, "input": "hi",
+                                                               "_strata_conv": forged}, headers))
+        self.assertIsNone(self.conv_sent("/v1/chat/completions", {**self.CHAT, "_strata_conv": forged,
+                                                                  "prompt_cache_key": "real"}))
+        self.assertEqual(self.conv_sent("/v1/chat/completions", {**self.CHAT, "_strata_conv": forged,
+                                                                 "prompt_cache_key": "real"}, self.SCOPE),
+                         "conv=" + conv_key_of("real", "my-agent"))
+
+    def test_responses_and_messages_do_not_send_it(self):
+        """Codex gives its sub-agents and forks the parent's prompt_cache_key, so on /v1/responses it is no
+        conversation identity (serve/responses.py); /v1/messages has no such field at all.  The opt-in changes neither."""
+        for headers in (None, self.SCOPE):
+            self.assertIsNone(self.conv_sent("/v1/responses", {"model": "m", "max_output_tokens": 8, "input": "hi",
+                                                               "prompt_cache_key": "codex-parent"}, headers))
+            self.assertIsNone(self.conv_sent("/v1/messages", {**self.CHAT, "prompt_cache_key": "k"}, headers))
+
+
 class SharedPrefix(unittest.TestCase):
     """R1: "strata_prefix" marks the first messages as a shared prefix; the engine gets pin=N."""
 

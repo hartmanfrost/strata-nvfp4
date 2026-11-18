@@ -226,6 +226,55 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
+    # the conversation key rule's lines (conv_key.hpp Tracker, written by generate.cpp), as the engine writes them - the
+    # same text, numbers and all, that src/program/conv_key_test.cpp has the Tracker produce
+    SUPERSEDED = ("strata serve: conversation cache: dropped superseded conversation (same conv key, 57373 shared tokens "
+                  "of its 87209) - not parked, not written to the disk tier; dropped_superseded=%d\n")
+    KEPT = ("strata serve: conversation cache: conv key does not supersede the outgoing conversation (too few tokens "
+            "shared: 80 shared tokens < 1024); it parks as before\n")
+    RULE_ON = ("strata serve: conversation cache: conv key rule on (STRATA_CONV_KEY_MIN_SHARED=1024): a request with the "
+               "live conversation's conv= key that shares that many tokens with it and does not continue it is not "
+               "parked\n")
+
+    def test_dropped_superseded(self):
+        """The rule's own counter (cumulative in the engine's line); it is neither a park, nor the #342 'dropped N
+        superseded copies' line, and the rule's other lines count nothing."""
+        from serve.server import ConvCacheLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("an earlier run\n" + self.SUPERSEDED % 9, encoding="utf-8")
+            start = log.stat().st_size
+            c = ConvCacheLog()
+            st = c.poll(str(log), start)
+            self.assertEqual((st["dropped_superseded"], st["parks"], st["parked"]), (0, 0, 0))
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(self.RULE_ON + self.PARK + self.SUPERSEDED % 1 + self.KEPT)
+            st = c.poll(str(log), start)
+            self.assertEqual((st["dropped_superseded"], st["parks"], st["parked"], st["restores"]), (1, 1, 1, 0))
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(self.SUPERSEDED % 2 + self.SUPERSEDED % 3 + self.RESTORE)
+            st = c.poll(str(log), start)
+            self.assertEqual((st["dropped_superseded"], st["parks"], st["restores"], st["parked"]), (3, 1, 1, 2))
+            with open(log, "a", encoding="utf-8") as f:       # #342's line says "dropped 1 superseded copy": not this counter
+                f.write("strata serve: conversation cache: dropped 1 superseded copy of this conversation; parked=1\n")
+            st = c.poll(str(log), start)
+            self.assertEqual((st["dropped_superseded"], st["parked"]), (3, 1))
+            self.assertEqual(c.poll(str(log), log.stat().st_size)["dropped_superseded"], 0)   # the engine started again
+
+    def test_the_engine_says_what_the_log_reader_reads(self):
+        """The engine's format strings and this reader's regexes cannot drift apart unnoticed: the lines above are the
+        engine's wording, so its source must still carry it (the rule's lines are written by conv_key.hpp's Tracker,
+        whose test, src/program/conv_key_test.cpp, prints them with these same numbers and compares them whole)."""
+        src = Path(__file__).resolve().parents[1] / "include" / "strata" / "program" / "conv_key.hpp"
+        if not src.is_file():
+            self.skipTest("no engine source in this tree")
+        text = src.read_text(encoding="utf-8")
+        for piece in ("conversation cache: dropped superseded conversation (same conv key, ", "dropped_superseded=%zu",
+                      "conversation cache: conv key does not supersede the outgoing ",
+                      "conversation cache: conv key rule %s (STRATA_CONV_KEY_MIN_SHARED=%lld)"):
+            self.assertIn(piece, text, piece)
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
@@ -238,6 +287,7 @@ class ConversationCacheCard(unittest.TestCase):
                 c = json.loads(r.read())["conversation_cache"]
             self.assertEqual((c["enabled"], c["budget_mib"], c["slots"], c["parked"], c["requests"]),
                              (True, 8192, 4, 0, 0))
+            self.assertEqual(c["dropped_superseded"], 0)      # the conversation key rule's counter is in the block
             req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
                                          data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode())
             with urllib.request.urlopen(req, timeout=10) as r:

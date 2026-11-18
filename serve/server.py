@@ -871,6 +871,32 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+# The opt-in for conv_key_of: a chat completions client that sends this header (its value: the client's own name, say
+# "my-agent") declares that its `prompt_cache_key` is one conversation's id - unique per conversation, its requests in
+# order.  The OpenAI API defines the field as a cache-routing bucket only, and many clients send one static key per
+# user, per app or per feature: two chats of such a client that share a long system prompt would look to the engine
+# like one conversation rewriting itself, and each would drop the other's cache in turn.  Without the header the key is
+# ignored.
+CONV_SCOPE_HEADER = "X-Strata-Conv-Scope"
+
+
+def conv_key_of(key, scope) -> str | None:
+    """The engine's conversation key (`conv=<16 hex>` on the GEN line) for a client's OpenAI `prompt_cache_key` under the
+    `scope` its X-Strata-Conv-Scope header names (CONV_SCOPE_HEADER): a 64-bit blake2b of the key, keyed by the scope, so
+    two clients that happen to use the same key string never share a conversation, and no client text reaches the
+    protocol (blanks and newlines in a key break nothing); 0 means "no key" to the engine, so a hash of 0 becomes 1.  None
+    without a scope (the client did not opt in) and for anything but a non-empty string key.  Requests with the same key
+    are one conversation, in order: with STRATA_CONV_KEY_MIN_SHARED set the engine does not park a conversation the same
+    key has just rewritten itself (a compaction, a prune, a rewind).  Only a hint: it can cancel a park, never pick or
+    restore a state."""
+    if not isinstance(key, str) or not key or not isinstance(scope, str) or not scope.strip():
+        return None
+    salt = hashlib.blake2b(scope.strip().encode("utf-8", "surrogatepass"), digest_size=32).digest()
+    h = int.from_bytes(hashlib.blake2b(key.encode("utf-8", "surrogatepass"), digest_size=8, key=salt).digest(),
+                       "little") or 1
+    return f"{h:016x}"
+
+
 class ConvCacheLog:
     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
@@ -878,6 +904,10 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # the conversation key rule (STRATA_CONV_KEY_MIN_SHARED): "... dropped superseded conversation (same conv key, N shared
+    # tokens of its M) - not parked ...; dropped_superseded=C" - C counts since the engine started.  Not the #342 line above
+    # (that one drops copies of a conversation that WAS parked) and never a "parked N tokens" event.
+    SUPERSEDED = re.compile(r"conversation cache: dropped superseded conversation .*?dropped_superseded=(\d+)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -887,7 +917,7 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "dropped_superseded": 0}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
@@ -931,6 +961,10 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                continue
+            m = self.SUPERSEDED.search(line)
+            if m:
+                self.state["dropped_superseded"] = int(m.group(1))
         return dict(self.state)
 
 
@@ -1696,6 +1730,12 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # `_strata_conv` (set by the chat completions route from `prompt_cache_key` when the client opted in with the
+        # X-Strata-Conv-Scope header, see conv_key_of; scrubbed from every request body): the client conversation this
+        # request belongs to.  Only a well-formed key is sent.
+        conv = sampling.get("_strata_conv")
+        if isinstance(conv, str) and re.fullmatch(r"[0-9a-f]{16}", conv):
+            keys += f" conv={conv}"
         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
         ik = sampling.get("strata_img_keys")
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
@@ -8665,6 +8705,7 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                req.pop("_strata_conv", None)                # internal (conv_key_of): a client cannot set it, on any route
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -9026,6 +9067,11 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            req.pop("_strata_conv", None)                      # (the route's own: only the lines below set it)
+            # the standard OpenAI field as one conversation's id, in order - only for a client that says so (the header)
+            conv = conv_key_of(req.get("prompt_cache_key"), self.headers.get(CONV_SCOPE_HEADER))
+            if conv is not None:
+                req["_strata_conv"] = conv                     # /v1/responses and /v1/messages never set it (Codex forks share a key)
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing

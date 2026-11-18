@@ -3494,6 +3494,38 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_CONV_KEY_MIN_SHARED",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 13934,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [
+    "serve/server.py"
+   ],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/DETAILS.md:1680"
+   ],
+   "status": "opt-in",
+   "owner": "program",
+   "note": "documented for users (docs/DETAILS.md:1680): N > 0 (1024 recommended) = do not park a conversation that a request with the same client conversation key (prompt_cache_key with the X-Strata-Conv-Scope header) has just rewritten; unset, 0 or not a number = off, the GEN line and the behaviour unchanged",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_COPY_ENGINE",
    "backends": [
     "sycl"

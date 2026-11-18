@@ -119,6 +119,7 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/conv_key.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/stage_reserve.hpp"
 #include "strata/program/split_walk.hpp"
@@ -13923,6 +13924,14 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // the conversation key (include/strata/program/conv_key.hpp): conv_rule keeps the `conv=` of the request that
+        // left `live` (0 = none: an unkeyed request, a restored session file) and the count of conversations it did not
+        // park.  STRATA_CONV_KEY_MIN_SHARED=N (opt-in, 0 = off): a request with the same key that shares N tokens or
+        // more with `live` but does not continue it has rewritten that conversation (a compaction, a prune, a rewind):
+        // it is not parked, so not written to the disk tier either.  Its four calls here: start_line, before_park (before
+        // the park sites), taken (where a request takes the session over), reset (a session file, the #879 flush).
+        strata::program::conv_key::Tracker conv_rule(
+            strata::program::conv_key::min_shared(std::getenv("STRATA_CONV_KEY_MIN_SHARED")));
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
@@ -14057,6 +14066,7 @@ int main(int argc, char** argv) {
                          segpool != nullptr ? segpool->capacity() >> 20 : (size_t) 0, ckpt_pool.on() ? "on" : "off", ckpt_pool_ready_env(),
                          ckpt_pool.cap(), park_ckpt_bytes >> 20, cache_mib_now, stages.size());
         segpool_kick();
+        if (const std::string l = conv_rule.start_line(conversations.enabled()); !l.empty()) std::fputs(l.c_str(), stderr);
         // --rope-scaling dynamic (core/rope_dynamic.hpp): what the session holds - the main layers' K and indexer keys
         // over `cells`, the drafter's K over `draft_cells`, the checkpoints' `dead` - goes from factor `from` to `to`,
         // and the table to `to`.  The device is quiet before and after.
@@ -18713,6 +18723,7 @@ int main(int argc, char** argv) {
                     cvec_cached = image.cvec;
                     if (rope_dyn.on) rope_dyn.live = image.rope;   // the next request moves it to its own factor
                     live_ok = true;
+                    conv_rule.reset();   // a restored file has no conversation key (conv_key.hpp)
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear() + conv_disk.clear();
@@ -18769,6 +18780,9 @@ int main(int argc, char** argv) {
             // verify window starts (the session holds n - 1 tokens, exactly what a next turn that continues it needs), and
             // stop: no token is made.  A SAVE after it is the hand-over to another engine (docs/SPLIT_SERVE.md).
             bool req_prefill_only = false;
+            // conv=<hex>: the client conversation this request belongs to (a hash of the OpenAI prompt_cache_key; absent or
+            // 0 = none).  A hint that can only cancel a park (conv_key.hpp); it never selects or restores a state.
+            uint64_t req_conv = 0;
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -18807,6 +18821,7 @@ int main(int argc, char** argv) {
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "prefill") req_prefill_only = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "conv") req_conv = strata::program::conv_key::parse_key(tok.c_str() + eq + 1);
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "hold") {
                         char* he = nullptr;
@@ -19151,6 +19166,7 @@ int main(int argc, char** argv) {
                 }
                 const size_t n_checks = checks.size();
                 live_ok = false;
+                conv_rule.reset();
                 checks.clear();
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear() + conv_disk.clear();
@@ -19494,6 +19510,42 @@ int main(int argc, char** argv) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
             }
+            // STRATA_CONV_KEY_MIN_SHARED=N (opt-in; conv_key.hpp has the rule and its truth table): this request carries the
+            // key of the conversation the session holds, does not continue it, and shares N tokens or more with it - the
+            // client rewrote its own conversation (a compaction, a prune, a rewind), so nothing will continue the old branch.
+            // It is not parked, and so never evicted on to the disk tier.  Without the key (or with another one: a subagent,
+            // a fork, a title request) the session parks as before.  `live_ok = false` is the cheapest way to say it:
+            // park_current_body returns at once, which turns all three park sites below into no-ops, and this request is
+            // about to set it false anyway (it is true again when the request ends).  It covers what upstream added around
+            // them too: the --conversation-cache-park-gain check and pin/reply/own-rewind skips only ever skip a park (they
+            // are in `parkable`, so a park none of them would have made is not counted as dropped); STRATA_PARK_ASYNC's
+            // park_drops is read only inside park_source, which park_current_body no longer reaches (the drops it names are
+            // then dropped as without it); and an idle batch slot's park (park_slot) already sees live_ok = false during
+            // every request, the rule or not, so it parks the same.  A hint only ever cancels a park - the
+            // restore below still needs the exact token prefix - so a wrong hint costs a conversation read again, never a
+            // different output.  Said in the log on every keyed request that would have parked (the counter is cumulative).
+            // No park also means no park took the K/V retained from an earlier restore: a borrow below drops it itself.
+            {
+                strata::program::conv_key::LoopState ks;   // the loop's values, one to one (request_of reads them)
+                ks.live_ok = live_ok;
+                ks.live_empty = live.empty();
+                ks.cache_enabled = conversations.enabled();
+                ks.cache_wants = conversations.wants((int64_t) live.size());
+                ks.pin_sibling = pin_sibling;
+                ks.own_rewind = own_rewind;
+                ks.reply_replaced = reply_replaced;
+                ks.park_worth = park_worth;
+                ks.from_live = from_live;
+                ks.slot_source = slot_source;
+                ks.admit_slot = admit_slot;
+                ks.req_images = !req_imgs.empty();
+                ks.live_images = !live_imgs.empty();
+                ks.want_cvec = want_cvec;
+                ks.cvec_cached = cvec_cached;
+                const auto kd = conv_rule.before_park(req_conv, ks, live, ids);
+                if (!kd.line.empty()) std::fputs(kd.line.c_str(), stderr);
+                if (kd.drop) live_ok = false;   // park_current_body returns at once: no park site below parks
+            }
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -19620,6 +19672,18 @@ int main(int argc, char** argv) {
             }
             if (borrow) {
                 const auto t0 = Clock::now();
+                // the device K/V up to parked.tokens is the donor's from here on: K/V retained from an earlier restore
+                // describes what was there before, and the limit_reuse(read_from) below would leave it marked unchanged
+                // over exactly the cells the donor overwrites - the next park would copy the old conversation's bytes
+                // for the prefix it shares with this one.  As copy_from_slot, a session file and the rope re-rotation do.
+                // (When the outgoing session was parked above, that park took it already: nothing to drop.  It is still
+                // here when no park ran - a session not live_ok, below --conversation-cache-min-tokens, held back by
+                // --conversation-cache-park-gain, or not parked under STRATA_CONV_KEY_MIN_SHARED.)
+                const int64_t kept = conversations.retained_tokens();
+                conversations.take_reuse();
+                if (kept > 0)
+                    std::fprintf(stderr, "strata serve: conversation cache: retained K/V of %lld tokens dropped: a borrowed "
+                                         "prefix replaces the session's K/V\n", (long long) kept);
                 const strata::core::SavedConversation* donor = conversations.find(parked.serial);   // still parked
                 if (donor == nullptr ||
                     strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
@@ -19744,6 +19808,7 @@ int main(int argc, char** argv) {
             else
                 checks.erase(std::remove_if(checks.begin(), checks.end(), off_path), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            conv_rule.taken(req_conv);   // ...and whoever it is left to, it is this request's conversation (conv_key.hpp)
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
