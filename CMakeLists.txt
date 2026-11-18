@@ -214,11 +214,12 @@ option(STRATA_OWN_CPU_QUANT "CPU expert pool on the Strata quant layer (src/quan
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
+  find_package(Threads REQUIRED)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
+  target_link_libraries(conversation_cache_test PRIVATE Threads::Threads)   # (an image dropped on another thread)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
   # STRATA_PARK_SEGPOOL_MIB: the arena behind the conversation buffers' segments (header-only; a fake OS counts the calls)
-  find_package(Threads REQUIRED)
   add_executable(conversation_segment_pool_test src/core/conversation_segment_pool_test.cpp)
   target_include_directories(conversation_segment_pool_test PRIVATE include)
   target_compile_features(conversation_segment_pool_test PRIVATE cxx_std_17)

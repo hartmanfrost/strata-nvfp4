@@ -510,6 +510,19 @@ bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapsho
     static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+// The disk tier and a park's background copies (STRATA_PARK_ASYNC, STRATA_CKPT_ASYNC): an image's K/V and running state
+// may still be landing from the device.  disk_tier_join: before the tier reads an image on this thread (write_now).
+// disk_tier_handoff: before an image goes to the tier's writer thread (put), which then owns it - the copies are joined
+// and the image's copy tokens dropped here, so their deleters (a join, a VRAM slot's release) never run on the writer.
+// Both are no-ops when nothing is in flight.
+void disk_tier_join() {
+    strata::core::conversation_park_join();
+    strata::core::conversation_checkpoint_join(nullptr);
+}
+void disk_tier_handoff(strata::core::SavedConversation& image) {
+    disk_tier_join();
+    strata::core::conversation_drop_async_tokens(image);
+}
 // STRATA_CKPT_POOL: unset = the engine's default (on in a single-stage serve with a conversation cache: park_pool_plan), 0 = off, any
 // other value = on.  -1 unset, 0 off, 1 on (read once)
 int ckpt_pool_env_state() {
@@ -14134,6 +14147,7 @@ int main(int argc, char** argv) {
             conversations.set_on_evict([&conv_disk, &pressure_evicting](strata::core::SavedConversation&& image) {
                 // written to the disk while the engine was idle (the idle save): that copy stays, nothing to write
                 if (image.disk_id != 0 && conv_disk.has(image.disk_id)) return;
+                disk_tier_handoff(image);
                 conv_disk.put(std::move(image), pressure_evicting);   // queued for the writer; a refusal is in its log
             });
         // freed images stay in malloc's heap, which MemAvailable does not count
@@ -14221,6 +14235,7 @@ int main(int argc, char** argv) {
                         } give_back{meta.checkpoints, checks};
                         uint64_t id = 0;
                         bool cancelled = false;
+                        disk_tier_join();   // (the checkpoints lent to it may still be landing)
                         if (conv_disk.write_now(meta, &sources, cancel, id, e, &cancelled)) {
                             live_synced_gen = live_gen;
                             ++wrote;
@@ -14245,6 +14260,7 @@ int main(int argc, char** argv) {
                 uint64_t id = 0;
                 bool cancelled = false;
                 std::string e;
+                disk_tier_join();   // (the image stays in RAM: its copy tokens with it)
                 if (conv_disk.write_now(img, nullptr, cancel, id, e, &cancelled)) {
                     conversations.set_disk_id(conversations.serial_at(i), id);
                     ++wrote;
@@ -14520,6 +14536,7 @@ int main(int argc, char** argv) {
                 }
                 image.rope = rope_dyn.live;   // --rope-scaling dynamic: the factor its K/V holds
                 const size_t snapshot_bytes = image.bytes();
+                if (to_disk) disk_tier_handoff(image);
                 const bool stored = to_disk ? conv_disk.put(std::move(image)) : conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              !stored ? "skipped" : to_disk ? "sent to the disk" : "parked", src.ids.size(), src.what.c_str(),

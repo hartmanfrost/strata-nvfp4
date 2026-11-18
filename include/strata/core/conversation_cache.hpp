@@ -228,6 +228,18 @@ struct SavedConversation {
     }
 };
 
+/// Drops the image's background-copy tokens: `pending`, `live_pending` and every K/V layer's `pending`, the later
+/// stages' images' too.  Their deleters join a device copy and free a VRAM slot (STRATA_PARK_ASYNC,
+/// STRATA_CKPT_ASYNC, STRATA_PARK_VRAM_MIB), so they must run on the host thread, never on the disk tier's writer
+/// thread when it drops an image it was handed: the host joins the copies (conversation_park_join,
+/// conversation_checkpoint_join) and calls this before the image goes to ConversationDiskTier::put.
+inline void conversation_drop_async_tokens(SavedConversation& image) {
+    image.pending.reset();
+    image.live_pending.reset();
+    for (auto& k : image.kv) k.pending.reset();
+    for (auto& s : image.stage_images) conversation_drop_async_tokens(s);
+}
+
 /// `c` holds the state `ids` (with `images`) describes, or a continuation of it: its tokens start with `ids` and
 /// its pictures below ids.size() are exactly `images`.  What an idle batch slot holds is then parked already (or
 /// a longer continuation is), so the slot need not park it again before an admission overwrites it.

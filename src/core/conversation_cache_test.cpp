@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 using namespace strata::core;
@@ -811,6 +812,31 @@ int main() {
             }
             check(refused > 0 && evicted_any > 0 && pool.shrinks > 0, "the workload refused, evicted and trimmed the pool at least once");
         }
+    }
+    {   // conversation_drop_async_tokens: the background-copy tokens' deleters run on the caller's thread (the host's),
+        // never on the thread an image is handed to afterwards (the disk tier's writer)
+        std::vector<std::thread::id> ran;
+        auto token = [&ran] { return std::shared_ptr<void>(new char, [&ran](void* p) { ran.push_back(std::this_thread::get_id()); delete (char*) p; }); };
+        SavedConversation img = image({1, 2, 3});
+        img.kv.resize(2);
+        img.kv[0].k.resize(64, 5);
+        img.pending = token(); img.live_pending = token();
+        for (auto& k : img.kv) k.pending = token();
+        SavedConversation stage = image({1, 2, 3});
+        stage.kv.resize(1);
+        stage.pending = token(); stage.live_pending = token(); stage.kv[0].pending = token();
+        img.stage_images.push_back(std::move(stage));
+        conversation_drop_async_tokens(img);
+        check(ran.size() == 7, "every token of the image, its K/V layers and its stage images is dropped");
+        check(std::all_of(ran.begin(), ran.end(), [](std::thread::id t) { return t == std::this_thread::get_id(); }),
+              "the tokens' deleters ran on the calling thread");
+        check(!img.pending && !img.live_pending && !img.kv[0].pending && !img.kv[1].pending &&
+              !img.stage_images[0].pending && !img.stage_images[0].live_pending && !img.stage_images[0].kv[0].pending,
+              "no token is left in the image");
+        check(img.kv[0].k.size() == 64 && img.live.ids.size() == 3, "the image's data stays");
+        std::thread writer([moved = std::move(img)]() mutable { SavedConversation gone = std::move(moved); });
+        writer.join();
+        check(ran.size() == 7, "the image dropped on another thread runs no deleter there");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
