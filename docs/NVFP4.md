@@ -830,7 +830,7 @@ fork's branches.
   - **Dialogs.**
     - `parallel`: dialogs at once, `--batch N`, 1-8. Empty: one at a time.
     - The RAM cache: `--conversation-cache-slots` (default 4) and `--conversation-cache-mib` (empty: off).
-    - The disk tier: `--conversation-disk-dir`, `--conversation-disk-mib` (default 32768) and
+    - The disk tier: `--conversation-disk-dir`, `--conversation-disk-mib` (the one storage limit, default 10240) and
       `--conversation-disk-persist`.
     - A key that needs another one is refused with its name: slots or a folder without RAM, a disk size or persist
       without a folder.
@@ -910,6 +910,112 @@ fork's branches.
   disk is not touched during a request).
   Since 0.1.44.1-nvfp4.1 the recommendation is smaller: kept dialogs and the disk tier stay off by default, and for one
   user `--conversation-cache-mib 8192` with the default 4 dialogs is enough; the disk tier is for many agents.
+
+### Chunked parked dialogs
+
+Opt-in format v2 of the disk tier above (`--conversation-disk-chunked`). Off by default; a folder may hold v1 files and v2
+manifests together and the reader takes both whatever the flag says. **Tested on a GPU:** it has served a coding agent's
+dialogs on one RTX 5090 (Linux, Docker) since 2026-10-21, with `--conversation-disk-codec zstd:1`, the default 512-token
+slabs and the default 10 GiB limit, beside a 2 GiB RAM cache, without `--conversation-disk-persist` or
+`--conversation-disk-shared`, the live state always written (numbers below).
+
+- **Why.** v1 writes a whole session file for every park: a 90K dialog that goes on from 60K writes ~1.6 GB again (1.1 GB
+  of K/V that did not change, plus 4 running states of 118 MB), and the old file waits next to the new one until the new
+  one is published. Siblings that share a 20K prompt each write that prefix again.
+- **Format.** An image is a small manifest (`strata-conv-*.bin`, magic `STRSESS\x02`) plus content-addressed chunks in a
+  pool folder `<dir>/strata-pool-<identity>/<xx>/<key>.chk` (non-persist: `strata-pool-n<nonce>`). A chunk is a slab of
+  `--conversation-disk-chunk-tokens` tokens of every K/V layer, or a 4 MiB slice of a checkpoint's running state; its key
+  is a 128-bit hash of the raw bytes (`SessionHasher::digest128`, the same pass as v1's hash), a chunk is immutable and
+  published by a no-replace rename, so writers need no lock. Chunk files are O_DIRECT-aligned like v1 (4096-byte header,
+  payload at 4096, size rounded up to 4096). Every read checks the size, the header hash, the manifest's lengths and the
+  hash of the raw bytes against the key.
+- **What is written.** A dialog that goes on writes the slabs from its last sealed one and the running states that
+  changed (a checkpoint that was written before costs nothing); a manifest per image, written last, so a crash leaves
+  orphans, not a half image. Every checkpoint of the chain is kept (v1 keeps the deepest one only).
+- **Lifetime and the storage limit.** The tier counts the references manifests hold. A read back (`take`) drops them, and
+  a chunk nobody references (a "ghost") **stays**: there is no time filter (the 10-minute grace of the first version is
+  gone), so the write that follows a read back finds its chunks again, and a ghost is a dedup cache until the room is
+  needed. **One limit** covers everything the tier keeps on the disk: `--conversation-disk-mib` (default 10240 = 10 GB,
+  for the one-file format too; 0 = tier off) counts the v1 files, the manifests and the whole chunk pool, ghosts included.
+  Over it, the OLDEST data goes first - least recently used: an entry's last write, hit or read-with-keep, a chunk's last
+  release, hit or read (the mtimes persist it, in nanoseconds, so a restart rebuilds the same order). First the
+  unreferenced chunks, oldest first and only as many as the room needs; if that is not enough, the oldest entries (their
+  chunks become ghosts and go the same way). **Removing an entry that is still valid means the limit is too small**, so
+  it logs (at most one line a minute, the rest counted into the next) `WARNING [disk-limit]: the conversation disk limit
+  is too small: evicted a parked conversation that was still referenced (N tokens, M MiB) to stay within L MiB; U MiB
+  were in use or needed. Raise --conversation-disk-mib (e.g. to Z).`, and counts it (`summary()`: "N forced: raise
+  --conversation-disk-mib"; `ConversationDiskStats::forced_evictions`, `forced_evicted_bytes`, `limit_warnings`,
+  `limit_rejected`). An image bigger than the whole limit is refused with the same warning. A pinned chunk (a read in
+  progress, a write that hit it) is never deleted. `--conversation-disk-ttl-min` is ignored with the chunked format (the
+  start line says so); only the one-file format (non-persist) keeps its upstream time limit. The only time-based rule
+  left is crash hygiene: a `.tmp-*` leftover older than 10 minutes is removed at open, and shared folders leave
+  other engines' young leftovers (10 minutes) alone at a start.
+- **Shared folders (`--conversation-disk-shared`).** Other engines' references are invisible, so an engine that evicts
+  ghosts (a) counts the chunk files it finds in the pool (a census, as ghosts, ordered by mtime), (b) never removes a
+  chunk any manifest in the folder names, and (c) never removes a chunk a live **lease** names. A write and a non-keep
+  take announce their chunks in a lease file (`.lease-*`, flock'ed while the process lives) before they look at, write
+  or read them; the deleter reads the leases, then every manifest, then the leases again (a take announces first and
+  removes its index after, a write publishes its index and drops its lease after), renames the victims aside (`.del-*`,
+  atomic), reads both once more, and puts back (`link`, never replacing) any victim that is named now. A writer racing the deleter
+  therefore finds the chunk missing and writes it again - a miss, never a manifest that names a deleted chunk (and
+  `before_publish` still re-checks). A lease whose lock can be taken belongs to a dead process: ignored and removed. When a manifest of another engine cannot be read nothing is deleted
+  and no entry is evicted for it (one warning; a manifest that stays unreadable is given up on after 3 passes).
+- **Prefix read.** A request that reuses a checkpoint shorter than the stored state reads only the slabs and the running
+  state up to that point (a sibling of a 20K prefix reads ~365 MB instead of a 1.6 GB file), the checkpoint becoming
+  the live state of the restored image.
+
+| flag (`serve/runconfig.py` key) | meaning |
+| --- | --- |
+| `--conversation-disk-chunked` (`conversation_disk_chunked`) | write format v2 (needs `--conversation-disk-dir`; v1 on Windows) |
+| `--conversation-disk-chunk-tokens N` | tokens of K/V per slab, a multiple of 4, 64..4096, default 512 |
+| `--conversation-disk-codec raw\|zstd[:L]` | how chunks are stored: raw (default; on btrfs `compress=zstd` the filesystem does the rest) or zstd level 1..19, byte-shuffled, tried per part and kept only where it shrinks it; needs a build with `STRATA_DISK_ZSTD` (the Docker build has it, libzstd-dev), else raw with a note in the start line; the reader takes either |
+| `--conversation-disk-live always\|skip\|auto` | skip: when a checkpoint lies within the gap behind the live state, write the dialog "as of" that checkpoint (no 118 MB live state; the next request reads the few tokens past it again); auto: skip for background writes only, never under RAM pressure or at QUIT |
+| `--conversation-disk-live-gap N` | the gap for skip/auto, tokens, default 4096 |
+
+- **Measured on the RTX 5090 (one agent session, 2026-10-21 07:00-08:10, 175 requests; 2 GiB of RAM cache, so every
+  park sent the one before it to the disk).** Seven images of 52K-87K tokens went to the disk. "Written" is the tier's
+  own count (manifest + new chunks); "whole image" is what the one-file format writes for the same image, computed from
+  the geometry (12,384 B of K/V per token, 112.6 MiB per running state, live + 3 checkpoints), which matches the first
+  write's measured raw size (1,244 MiB):
+
+  | park | tokens | written | whole image | written / whole |
+  | --- | --- | --- | --- | --- |
+  | 1 (the first: nothing to share) | 67,289 | 1,149 MiB | 1,245 MiB | 92% (zstd:1 alone) |
+  | 2 | 86,437 | 521 MiB | 1,471 MiB | 35% |
+  | 3 | 87,209 | 814 MiB | 1,480 MiB | 55% |
+  | 4 | 64,495 | 746 MiB | 1,212 MiB | 62% |
+  | 5 | 52,828 | 795 MiB | 1,074 MiB | 74% |
+  | 6 | 86,898 | 692 MiB | 1,477 MiB | 47% |
+  | 7 | 58,689 | 269 MiB | 1,143 MiB | 24% |
+  | all | | 4,986 MiB | 9,103 MiB | 55% |
+
+  A match on image 5 came back from the disk in 859 ms (52,601 tokens, 962 MiB read; the request then read 2,913 prompt
+  tokens instead of ~46K). zstd:1 alone: 1,244 -> 1,147 MiB (-8%) on image 1; on the benchmark's writes of the same host
+  (2026-11-18, 25 to 33K tokens, nothing shared) 8-15%, the writes running at 0.9-1.5 GB/s with direct I/O and 2 workers.
+  Most of the saving is the deduplication of the 512-token slabs; what is left is mostly the new running states (112.6
+  MiB each), which `--conversation-disk-live skip` leaves out. Sibling dedup needs bit-equal K/V, true by construction for
+  images made through a borrow; for independent prefills a miss is safe, it only costs the ratio. On btrfs with
+  `compress=zstd` the filesystem compresses the raw codec's files as well.
+- **Measure real files.** `conversation_measure` (CMake target of `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`) reads a v1
+  session file (a `/slots` save, or what the tier wrote) or a v2 manifest with its pool and reports the sections of the
+  image, the zstd ratios (plain and shuffled, every encode decoded and compared) and, with `--vs FILE2`, how much of
+  FILE2 a pool holding FILE would deduplicate: `conversation_measure measure a.bin --vs b.bin --chunk-tokens 512 --cross-check`.
+- **Tests (CPU only, no GPU, no engine build; `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`):** `conversation_chunks_test`
+  (chunks, pool, manifest, limits, codec, deduplication, crash and race cases), `conversation_disk_test` (the tier, in v1
+  and chunked mode, with and without zstd; the limit: LRU order, forced-eviction warnings and their rate limit, pinned
+  chunks, restart order from mtimes, shared leases and races; clean under `-fsanitize=thread`), `conversation_file_test`,
+  `conversation_measure selftest`, and `serve/test_runconfig.py` for the run-config keys. By hand, without CMake:
+  `g++ -std=c++20 -O1 -Iinclude -pthread src/core/conversation_disk_test.cpp src/core/conversation_disk.cpp
+  src/core/conversation_file.cpp src/core/conversation_chunks.cpp src/core/conversation_codec.cpp -o conversation_disk_test`
+  (add `-DSTRATA_DISK_ZSTD=1 -lzstd` for the codec; `-fsanitize=thread` for the writer threads). The tests write under
+  `$TMPDIR`.
+- **Not verified on a GPU:** the `STRATA_SNAPSHOT_VERIFY` round trip, `--conversation-disk-live skip|auto` in a
+  running engine, the chunked format with `--conversation-disk-persist` or `--conversation-disk-shared` (two engines on
+  one folder: threads and hooks in the tests only), an A/B of restore times against v1 on the same dialogs, Windows
+  (the flag writes v1 there) and HIP. The measured runs above used this code before two later fixes, which are
+  covered by the CPU tests only: the host thread joins a park's background copies before the tier reads or takes an
+  image (it acts only with `STRATA_PARK_ASYNC=1`), and the tier's writer thread and the chunk workers leave the host
+  thread's core.
 
 ### Upstream 0.1.44 (2026-10-14, release 0.1.44-nvfp4.1)
 

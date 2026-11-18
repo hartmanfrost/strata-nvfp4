@@ -198,6 +198,9 @@ files by hand.
     cache has no room for goes to a folder; a 100K dialog comes back in ~1 s instead of 11-12 s, also after the tray
     restarts the engine ([numbers](docs/NVFP4.md#dialogs-parked-on-the-disk-2026-10-13-branch-extrasdialog-park)).
     For one user `--conversation-cache-mib 8192` (4 dialogs in RAM) is enough; the disk tier is off by default.
+    Opt-in `--conversation-disk-chunked` writes a dialog as a manifest plus deduplicated chunks, so one that goes on
+    writes only what changed (on an RTX 5090, one measured agent session wrote about half the bytes the one-file format
+    would have, computed; [details](docs/NVFP4.md#chunked-parked-dialogs)).
   - **Model settings** has the dialogs and the context size (to 512K, with the RoPE extension past 262K); the
     controls are back inside the card.
   - The Windows zip ships `strata_kq.dll` (upstream's K-quant prompt kernels, for UD-Q5_K_XL / UD-Q6_K_XL and

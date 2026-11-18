@@ -1706,8 +1706,11 @@ when the disk holds a longer prefix than the session, a `--batch` slot or the RA
 - a background thread (CPU nice 10 on Linux) writes them, so a switch never waits for the disk; a conversation asked
   for again before its write started comes back from RAM, one being written is waited for, then read. A queued image
   holds its RAM until it is written: parking, and a read back, wait for the queue before they evict more;
-- `--conversation-disk-ttl-min N` (default 30): a conversation stays on the disk N minutes after it was written;
-  `--conversation-disk-mib N` (default 32768): the files' total, oldest out first;
+- `--conversation-disk-ttl-min N` (default 30): a one-file conversation stays on the disk N minutes after it was written
+  (ignored with `--conversation-disk-chunked`, which has no time limit);
+  `--conversation-disk-mib N` (default 10240): THE storage limit, the files' total (chunked: manifests and the whole
+  chunk pool, unreferenced chunks included), least recently used out first; removing a conversation that is still valid
+  logs `WARNING [disk-limit]` = raise it (docs/NVFP4.md, "Lifetime and the storage limit");
 - a read back removes it from the disk (the session holds it again, and it is parked again on the next switch) -
   except a match on one of its checkpoints (another conversation borrowing its prefix, #1164's rule) and, with
   `--conversation-disk-persist`, every read: the entry stays as the copy that survives a crash, and a newer copy of
@@ -1725,6 +1728,13 @@ prompt was being read (they share the CPU with it at a lower priority); a reques
 asked for a conversation still being written. After the engine ended no file was left. Unit test:
 `conversation_disk_test` (CPU only, `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`; also clean under ThreadSanitizer). Not run
 on Windows or HIP.
+
+**Chunked parked dialogs (opt-in, `--conversation-disk-chunked`, with `--conversation-disk-dir`).** The disk tier can write
+a conversation as a small manifest plus content-addressed chunks (K/V slabs and slices of the running states) in a pool
+folder instead of one session file, so a conversation that goes on, and siblings that share a prompt, write only the chunks
+that are new; optionally zstd per chunk (`--conversation-disk-codec`), and a live state left out when a checkpoint lies just
+behind it (`--conversation-disk-live`). Reads take v1 and v2 alike. Format, lifetime of the chunks, flags, measured gains
+and tests: docs/NVFP4.md "Chunked parked dialogs"; code: `conversation_chunks.hpp`, `conversation_codec.hpp`.
 
 **Conversations that outlive the engine (opt-in, `--conversation-disk-persist`, with `--conversation-disk-dir`).**
 Who it is for: whoever does not keep Strata running all day - start it, continue yesterday's long session, stop it -

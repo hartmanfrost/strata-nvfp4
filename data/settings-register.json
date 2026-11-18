@@ -2906,6 +2906,52 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_CHUNKS_GOLDEN_PRINT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/conversation_chunks_test.cpp",
+     "line": 323,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/conversation_chunks_test.cpp",
+     "line": 912,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/conversation_chunks_test.cpp",
+     "line": 914,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/conversation_chunks_test.cpp",
+     "line": 2121,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "core",
+   "note": "test only (conversation_chunks_test): prints the format golden values (manifest bytes and hash, digest128 keys) instead of checking them, to refresh them after a deliberate format change; never read by the engine",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_CKPT_ASYNC",
    "backends": [
     "cuda"
