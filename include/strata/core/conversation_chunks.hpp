@@ -8,7 +8,11 @@
 // A K/V slab (T tokens of every K/V layer) and a 4 MiB slice of a checkpoint's running state are chunks; an image that
 // continues a conversation re-uses every chunk whose bytes did not change.  Chunks are immutable and published by a
 // no-replace rename, so writers need no lock; whether a chunk is still wanted is the tier's reference count (a view
-// of the folder, rebuilt from the manifests), and an unreferenced chunk waits out a grace period before it is deleted.
+// of the folder, rebuilt from the manifests).  There is no time limit: an unreferenced chunk (a "ghost") stays as a
+// dedup cache until the tier's storage limit needs the room, and then the OLDEST ghost (least recently used: its last
+// release, hit or read) goes first; a referenced or pinned chunk is never deleted by the pool.  Several engines on one
+// folder (`shared`) announce the chunks a write or a take is about to use in a lease file (ChunkLease), and a deleter
+// never removes a chunk a lease or a manifest names.
 // Every read checks the chunk's size, header hash, the lengths the manifest expects and the hash of the raw bytes
 // against the key.  Little-endian only.  Pure host code: no CUDA.  POSIX only (the pool refuses to open elsewhere).
 #pragma once
@@ -78,13 +82,34 @@ struct ChunkPoolOptions {
     int zstd_level = 1;
     bool direct = true;                 // O_DIRECT; false or STRATA_SESSION_BUFFERED=1: buffered + sync_file_range + FADV_DONTNEED
     uint64_t min_free_bytes = 0;        // a new chunk needs its file plus this much free (free-space preflight)
-    int64_t grace_s = 600;              // an unreferenced chunk is kept this long (from its last touch)
-    std::function<int64_t()> clock_s;   // tests: seconds since the epoch for the grace comparisons (default: the system clock)
+    bool shared = false;                // other engines use the folder: leases (ChunkLease) and the census (ChunkPool::census)
     // tests: return an errno value to make a step fail, 0 to go on: "chunk_write" (EINVAL while direct: the buffered
     // fallback), "chunk_sync" (buffered mode: the writeback step), "chunk_flush" (durable fdatasync), "chunk_rename",
     // "shard_sync"
     std::function<int(const char* step)> fault;
 };
+
+// Shared folders: the chunks one write (or one non-keep take) is about to hit, write or read.  An engine that deletes
+// ghosts reads every lease before it reads the manifests, and never deletes a chunk a lease names.  The file is created
+// under a temporary name, flock()ed, and renamed to ".lease-<rand>": a deleter never sees an unlocked half-made lease,
+// and a lease whose flock can be taken belongs to a dead process (ignored and removed).  Destroying the object (or
+// release()) removes the file.  Thread-safe.
+class ChunkLease {
+public:
+    ~ChunkLease();
+    ChunkLease(const ChunkLease&) = delete;
+    ChunkLease& operator=(const ChunkLease&) = delete;
+    // Appends the keys (a key already announced is skipped).  Must come BEFORE the chunk is hit, written or read.
+    void announce(const ChunkKey&);
+    void announce(const ChunkRef*, size_t n);
+    void release();
+private:
+    friend class ChunkPool;
+    ChunkLease() = default;
+    struct Impl;
+    std::unique_ptr<Impl> p_;
+};
+
 struct ChunkPutInfo {
     bool hit = false;                   // the chunk was already there (nothing written)
     uint32_t stored_len = 0;
@@ -102,8 +127,9 @@ public:
     ~ChunkPool();
     ChunkPool(const ChunkPool&) = delete;
     ChunkPool& operator=(const ChunkPool&) = delete;
-    // Creates the folder (0700) and indexes the chunks already there (unreferenced: they are ghosts until the owner
-    // refs them or the grace runs out); removes the leftover temporary files older than 10 minutes.
+    // Creates the folder (0700) and indexes the chunks already there (unreferenced: they are ghosts, ordered by their
+    // files' mtime - nanoseconds - until the owner refs them or the limit needs the room); removes the leftover
+    // temporary files (crash hygiene, not retention) older than 10 minutes.
     bool open(std::string& error);
     // Thread-safe.  The chunk is referenced (+1) for the caller on return; a writer that fails unref()s its whole list.
     // `buf` holds the raw bytes at payload().
@@ -111,7 +137,7 @@ public:
     // `shuffle_width`.
     bool put_buffer(ChunkKind, ChunkBuffer& buf, size_t raw_len, uint8_t shuffle_width, ChunkRef& out,
                     ChunkPutInfo& info, std::string& error, bool durable = false,
-                    const std::vector<CodecSegment>* segments = nullptr);
+                    const std::vector<CodecSegment>* segments = nullptr, ChunkLease* lease = nullptr);
     // The same from raw bytes elsewhere (one copy into a staging buffer).
     bool put(ChunkKind, const void* raw, size_t raw_len, uint8_t shuffle_width, ChunkRef& out, ChunkPutInfo& info,
              std::string& error, bool durable = false);
@@ -121,16 +147,32 @@ public:
     bool exists(const ChunkRef&) const;                     // stat + the size formula, no data read
     // References are this tier's view of the folder; a pin is one more ref.
     void ref(const ChunkRef*, size_t n);
-    void unref(const ChunkRef*, size_t n);                  // at 0 the chunk becomes a ghost (its grace starts now)
-    // Deletes ghosts.  Not shared: the owner of the folder - an unreferenced chunk goes when its grace ran out, or
-    // right away under `pressure`; never a referenced or pinned one.  `shared`: other engines use the folder and their
-    // references are invisible, so only a chunk that no manifest names (`foreign_refs`: every key any manifest in the
-    // folder names) and whose file is older than the grace goes, re-checked by stat just before the unlink.
-    size_t sweep(bool shared, bool pressure, const std::set<ChunkKey>* foreign_refs, size_t* freed_bytes = nullptr);
+    void unref(const ChunkRef*, size_t n);                  // at 0 the chunk becomes the NEWEST ghost
+    // Shared: a lease for one write or take (null when the pool is not shared).
+    std::unique_ptr<ChunkLease> begin_lease();
+    // Deletes ghosts, OLDEST first (by last release / hit / read), until at least `want_bytes` of file bytes are freed
+    // (UINT64_MAX: all of them).  Never a referenced or pinned chunk (those are not ghosts).  Not shared: unlinked.
+    // Shared: other engines' references are invisible, so `named` is asked for the keys every manifest in the folder
+    // names (false: it could not tell - nothing is deleted); a victim named by a manifest or a lease is kept, the
+    // others are renamed away, the snapshot is taken again, and the ones it names now are put back (a writer or a
+    // taker raced this deleter); the rest are unlinked.  Returns the chunks removed.  Each round reads the leases, the
+    // manifests, then the leases AGAIN: a take announces its chunks before it removes its index, so a lease that
+    // appears between the first lease read and the manifest read is caught by the second.  `undecided` (optional) is
+    // set when `named` could not tell (shared): nothing was deleted for that reason, and the caller should not conclude
+    // that the room cannot be made.
+    size_t evict_ghosts(uint64_t want_bytes, const std::function<bool(std::set<ChunkKey>&)>& named = {},
+                        uint64_t* freed_bytes = nullptr, bool* undecided = nullptr);
+    // Shared: takes the chunk files other engines wrote into the index as ghosts (ordered by mtime) and forgets the
+    // unreferenced ones that are gone.  Cheap (a folder listing, an lstat per new file).  No-op when not shared.
+    void census();
     // durable writes: fsync the shard folders touched since the last call
     bool sync_touched_shards(std::string& error);
     uint64_t bytes() const;                                 // file bytes of every known chunk, ghosts included
     uint64_t live_bytes() const;                            // the same for the referenced or pinned chunks only
+    uint64_t ghost_bytes() const;                           // the same for the unreferenced ones (the next to go)
+    size_t ghost_count() const;
+    // tests: the ghosts' keys, oldest first
+    std::vector<ChunkKey> ghosts_oldest_first() const;
     uint32_t refs_of(const ChunkKey&) const;                // tests and diagnostics (0 for an unknown chunk)
     size_t count() const;
     void remove_all();                                      // the whole folder: non-persist end, clear()
@@ -147,6 +189,7 @@ struct ChunkedWriteOptions {
     uint64_t min_free_bytes = 0;        // (the pool's own option decides the per-chunk preflight; reserved)
     int workers = 1;                    // 1: everything on the calling thread; N: N threads hash, encode and write (1..8)
     bool low_priority = true;           // the worker threads run at nice +5 (Linux)
+    ChunkLease* lease = nullptr;        // shared: every chunk is announced in it before it is looked at or written
     std::function<bool()> cancel;       // asked before every chunk (with workers, from the worker threads too, never two calls at once): true gives the write up (error "cancelled")
     SessionProgress progress;           // (raw bytes done, raw bytes of the image) after every chunk
     SessionPhase phase;                 // "flush" and "publish" before each starts
@@ -192,7 +235,9 @@ bool chunked_read(ChunkPool&, const std::string& manifest_path, const SessionFil
                   const ChunkedReadOptions& = {}, SessionStatus* = nullptr);
 // The manifest's header and chunk references only (the tier's scan and rescan).
 bool chunked_manifest_refs(const std::string& manifest_path, const SessionFileIdentity&, std::vector<ChunkRef>& refs,
-                           uint64_t& manifest_bytes, std::string& error);
+                           uint64_t& manifest_bytes, std::string& error, bool* transient = nullptr);
+// transient (optional): set on a failure that says nothing about the file itself (an I/O or resource error: EMFILE,
+// ENOMEM, EIO) as against a file that was read and is invalid.
 bool is_chunked_manifest(const std::string& path);          // the first 8 bytes are "STRSESS\x02"
 // What the RAM preflight is asked for: the parsed image, three chunk buffers per worker (file, raw, decode temporary),
 // the small vectors.  `max_chunk_raw`: the largest chunk of the manifest when it is parsed (0: a guess from chunk_tokens).

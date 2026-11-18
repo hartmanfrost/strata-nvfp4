@@ -1,6 +1,7 @@
 // The disk tier of --serve's parked conversations (--conversation-disk-dir): the RAM cache's evictions
 // (ConversationCache::set_on_evict) are written to session files (conversation_file.hpp, one per layer-split stage)
-// by a background thread and read back when a request continues them, within a time limit and a byte budget.
+// by a background thread and read back when a request continues them, within a byte limit (and, for the one-file
+// format of a non-persistent run, a time limit).
 // By default only this process reads its files back, and the folder's files of this tier are removed at start and at
 // the end.  `persist`: the files are bound to the session files' identity (model and settings) instead, a small index
 // file beside each conversation lists its tokens, and the next start picks them up (no time limit, the budget only).
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -51,10 +53,21 @@ bool conversation_disk_skip_live(LivePolicy policy, int64_t live_tokens, int64_t
 /// "always", "skip" or "auto".  False + `error` otherwise.
 bool conversation_disk_parse_live(const std::string& text, LivePolicy& policy, std::string& error);
 
+/// --conversation-disk-mib's default: the one storage limit of the disk tier, in MiB (10 GB; v1 and chunked alike).
+constexpr int64_t kConversationDiskDefaultMib = 10240;
+
 struct ConversationDiskOptions {
     std::string dir;                 ///< empty: the tier is off
-    uint64_t budget_bytes = 0;       ///< at most this many bytes of files; 0: off
-    int64_t ttl_s = 30 * 60;         ///< a file older than this is removed (<= 0: kept until the budget evicts it)
+    /// THE storage limit: at most this many bytes of files on the disk - the v1 files, the manifests and the whole chunk
+    /// pool, unreferenced chunks included; 0: off.  Over it, the OLDEST data goes first (least recently used: an
+    /// entry's last write, hit or read; a chunk's last release, hit or read): first the unreferenced chunks, then the
+    /// oldest entries (their chunks become unreferenced and go in the same order).  Removing an entry that is still
+    /// valid logs a "WARNING [disk-limit]" (rate limited) and counts in ConversationDiskStats::forced_evictions: the
+    /// limit is too small.  --serve's default is 10240 MiB.
+    uint64_t budget_bytes = 0;
+    /// A file older than this is removed (<= 0: kept until the limit evicts it).  v1 (one file per conversation) only:
+    /// the chunked format has no time limit and ignores it.
+    int64_t ttl_s = 30 * 60;
     uint64_t min_free_bytes = 0;     ///< a write needs the file plus this much free on the disk (session preflight)
     bool persist = false;            ///< keep the files for later runs, bound to `identity`
     SessionFileIdentity identity;    ///< persist: the session files' identity (model and settings fingerprints)
@@ -72,8 +85,6 @@ struct ConversationDiskOptions {
     int io_workers = 2;              ///< chunked: threads of the chunk pipeline (hash, codec, write; parallel decode on read)
     LivePolicy live_policy = LivePolicy::always;   ///< chunked: see LivePolicy
     int64_t live_gap = 4096;         ///< chunked, skip/auto: the live state is dropped when a checkpoint is at most this many tokens behind it
-    /// chunked, tests: seconds since the epoch for the chunks' grace periods (default: the system clock)
-    std::function<int64_t()> wall_clock_s;
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
     /// Tests: called on the writer thread before each write starts.
@@ -85,7 +96,7 @@ struct ConversationDiskOptions {
 /// What the tier did since it started (diagnostics).
 struct ConversationDiskStats {
     size_t queued = 0, written = 0, write_failed = 0, ram_hits = 0, disk_hits = 0, read_failed = 0;
-    size_t expired = 0, evicted = 0, waits = 0;
+    size_t expired = 0, evicted = 0, waits = 0;   ///< evicted = forced_evictions (entries removed over the limit)
     size_t synced = 0, sync_cancelled = 0, superseded = 0, kept = 0;   ///< write_now; supersede; take(keep)
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
@@ -93,7 +104,10 @@ struct ConversationDiskStats {
     // chunked (format v2): chunks looked up by the writes, and what they cost
     uint64_t chunks_hit = 0, chunks_new = 0;
     uint64_t raw_bytes = 0, dedup_bytes = 0, new_file_bytes = 0;   ///< K/V + state bytes seen; of them already stored; new chunk file bytes
-    uint64_t chunks_swept = 0, swept_bytes = 0;                    ///< unreferenced chunks deleted
+    uint64_t chunks_swept = 0, swept_bytes = 0;                    ///< unreferenced chunks evicted for the limit (oldest first)
+    /// the storage limit was too small: entries still valid removed to fit it (and the bytes they held), WARNING lines
+    /// logged (rate limited: one a minute), and images refused because one alone is over the limit
+    uint64_t forced_evictions = 0, forced_evicted_bytes = 0, limit_warnings = 0, limit_rejected = 0;
     bool direct_io = false;                                        ///< the last chunk write used O_DIRECT
     uint64_t prefix_reads = 0, prefix_raw_bytes = 0;               ///< takes that read a prefix of the entry; the bytes they read
     uint64_t live_skipped = 0, live_skipped_tokens = 0;            ///< writes made "as of" a checkpoint; the tokens they left out
@@ -196,7 +210,7 @@ public:
     /// #879: every conversation goes - queued, being written (waited for) and on the disk, files too.  Returns how many.
     size_t clear();
 
-    /// Removes the entries older than the time limit; returns how many.
+    /// Removes the entries older than the time limit (v1 only: the chunked format has none); returns how many.
     size_t expire();
 
     size_t size() const;                    ///< entries on the disk
@@ -220,6 +234,7 @@ private:
         bool chunked = false;                    ///< format v2: `files` are manifests, `refs` the chunks they name
         std::vector<ChunkRef> refs;              ///< every chunk of every manifest, duplicates included (each ref()'d once)
         uint64_t manifest_bytes = 0;
+        int64_t idx_ns = 0;                      ///< persist: the index file's mtime at scan (ns): the LRU order a restart rebuilds
         uint64_t written_bytes = 0;              ///< bytes this write put on the disk (chunked: new chunks + manifests)
         std::string chunk_note;                  ///< the write's chunk counters, for its log line
         std::string index;                       ///< persist: the index file
@@ -246,24 +261,35 @@ private:
     void log(const std::string& line) const;
     SessionFileIdentity file_identity() const;
     bool write_index(Entry& e, std::string& error) const;
-    bool read_index(const std::string& path, Entry& e) const;
+    bool read_index(const std::string& path, Entry& e, bool* transient = nullptr) const;
     std::string scan_folder(size_t& stale, std::error_code& ec);   // open(): take in or remove; its log part
     // chunked (format v2); all with m_ held unless noted
     bool bind_chunks(Entry& e) const;                // a scanned entry's manifests: refs taken, chunks checked; false = refuse it
     void release_refs(Entry& e) const;               // unref + forget
     uint64_t pool_bytes_all() const;                 // pool.bytes() or 0
-    void make_room_locked(uint64_t protect_a, uint64_t protect_b, size_t& evicted);   // the budget loop
-    size_t sweep_locked(bool force);                 // unreferenced chunks, not shared (open()): rate limited (once a minute)
-    // Unreferenced chunks, rate limited; WITHOUT m_ (called with it released: the folder listing, the manifest parsing
-    // of a shared sweep and the unlinks do not hold up best() / take() / put()).  `freed`: the bytes it removed.
-    size_t sweep_pool(bool force, uint64_t* freed = nullptr);
-    // shared: every chunk any manifest of this identity names; `held`: this engine's entries (index path -> their chunks)
-    std::set<ChunkKey> foreign_refs(const std::vector<std::pair<std::string, std::vector<ChunkKey>>>& held) const;
+    // The limit loop: total = the files' bytes + the manifests + the whole pool, ghosts included.  Over the limit: the
+    // oldest unreferenced chunks go (ChunkPool::evict_ghosts), then the oldest entry (LRU; a WARNING each time), and so on.
+    void make_room_locked(uint64_t protect_a, uint64_t protect_b, size_t& evicted);
+    // (m_ held) one rate-limited "WARNING [disk-limit]" line (queued; flush_warnings() logs it with m_ released)
+    enum class LimitEvent { evicted, rejected, remaining, undecided };
+    void warn_limit_locked(LimitEvent what, int64_t tokens, uint64_t entry_bytes, uint64_t demand_bytes);
+    void flush_warnings();                           // without m_
+    uint64_t footprint(const Entry& e) const;        // the bytes removing `e` can free at most: manifests + its chunks
+    void touch_index(const Entry& e) const;          // persist: the index file's mtime = now (the LRU order a restart rebuilds)
+    // shared: the entries other engines publish or use move in the list by their index files' mtime
+    void sort_by_use_locked();
+    // shared: every chunk any manifest of this identity names (this engine's entries from memory, the others' parsed
+    // from their manifests, cached per index file); false: it could not be told
+    bool named_chunks_locked(std::set<ChunkKey>& out);
     void remove_foreign_pools() const;               // open(): other runs' (non-persist) or identities' pools
     std::string pool_dir() const;
     std::unique_ptr<ChunkPool> pool_;
-    bool swept_ = false;
-    Clock::time_point last_sweep_{};
+    std::map<std::string, std::vector<ChunkKey>> named_cache_;   ///< shared: index path -> the chunks its manifests name
+    std::map<std::string, int> named_fail_;          ///< shared: index path -> consecutive passes its manifest did not parse
+    std::vector<std::string> warn_lines_;            ///< queued by warn_limit_locked
+    bool limit_warned_ = false;                      ///< a WARNING was logged ...
+    Clock::time_point limit_warn_at_{};              ///< ... at this time (now_()): at most one a minute
+    size_t limit_warn_pending_ = 0;                  ///< events since the last line
     std::set<std::string> seen_index_;   ///< shared: index files looked at already (taken in, or another identity's)
 
     ConversationDiskOptions options_;

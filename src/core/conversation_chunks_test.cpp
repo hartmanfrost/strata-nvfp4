@@ -195,29 +195,26 @@ std::string own_prefix() { return "strata-chunks-test-" + std::to_string((long l
 struct Fx {
     fs::path root, pool_dir, man;
     std::unique_ptr<ChunkPool> pool;
-    int64_t clock = 1000000;
     std::vector<std::string> steps;
     std::mutex steps_mu;   // the pool calls the hook from every writer thread
     std::function<int(const char*)> fault;
     ChunkCodec codec = ChunkCodec::raw;
     int level = 1;
-    explicit Fx(const std::string& name, bool direct = true, int64_t grace = 600) {
+    explicit Fx(const std::string& name, bool direct = true) {
         root = fs::temp_directory_path() / (own_prefix() + name + "-" +
                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         fs::create_directories(root);
         pool_dir = root / "strata-pool-test";
         man = root / "manifest.bin";
-        make_pool(direct, grace);
+        make_pool(direct);
     }
-    void make_pool(bool direct, int64_t grace = 600, uint64_t min_free = 0) {
+    void make_pool(bool direct, uint64_t min_free = 0) {
         ChunkPoolOptions o;
         o.dir = pool_dir.string();
         o.direct = direct;
-        o.grace_s = grace;
         o.min_free_bytes = min_free;
         o.codec = codec;
         o.zstd_level = level;
-        o.clock_s = [this] { return clock; };
         o.fault = [this](const char* s) { { std::lock_guard<std::mutex> g(steps_mu); steps.push_back(s); } return fault ? fault(s) : 0; };
         pool = std::make_unique<ChunkPool>(o);
         std::string e;
@@ -531,8 +528,21 @@ void test_chunk_corruption() {
     }
 }
 
+// the file's mtime in nanoseconds, and a way to set it
+int64_t mtime_ns_of(const fs::path& p) {
+    struct stat st {};
+    return ::stat(p.c_str(), &st) == 0 ? (int64_t) st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec : -1;
+}
+void set_mtime_ns(const fs::path& p, int64_t ns) {
+    struct timespec ts[2] = {{0, UTIME_OMIT}, {(time_t) (ns / 1000000000ll), (long) (ns % 1000000000ll)}};
+    ::utimensat(AT_FDCWD, p.c_str(), ts, 0);
+}
+int64_t now_ns() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 void test_pool_lifecycle() {
-    Fx fx("life", true, 600);
+    Fx fx("life", true);
     ChunkPool& pool = *fx.pool;
     std::string err;
     ChunkPutInfo info;
@@ -544,47 +554,28 @@ void test_pool_lifecycle() {
     check(pool.count() == 3, "pool count");
     const uint64_t total = pool.bytes();
     check(total == chunk_file_size(5000) + chunk_file_size(5100) + chunk_file_size(5200), "pool bytes are the file sizes");
-    // referenced: never swept
-    check(pool.sweep(false, true, nullptr) == 0 && pool.count() == 3, "a pressure sweep leaves referenced chunks");
+    check(pool.ghost_count() == 0 && pool.ghost_bytes() == 0, "referenced chunks are no ghosts");
+    // referenced: never evicted
+    check(pool.evict_ghosts(UINT64_MAX) == 0 && pool.count() == 3, "evicting everything leaves the referenced chunks");
     pool.unref(&refs[0], 1);
-    check(pool.refs_of(refs[0].key) == 0, "ghost");
-    fx.clock += 599;
-    check(pool.sweep(false, false, nullptr) == 0, "a ghost survives inside the grace");
-    fx.clock += 2;
-    size_t freed = 0;
-    check(pool.sweep(false, false, nullptr, &freed) == 1 && freed == chunk_file_size(5000), "a ghost goes after the grace");
-    check(!fs::exists(pool.path_of(refs[0].key)) && pool.bytes() == total - chunk_file_size(5000), "file removed, bytes updated");
-    // a pressure sweep takes a fresh ghost at once, never a referenced chunk
+    check(pool.refs_of(refs[0].key) == 0 && pool.ghost_count() == 1 && pool.ghost_bytes() == chunk_file_size(5000), "ghost");
+    // there is no time filter: a ghost whose file is decades old stays while nothing is wanted
+    set_mtime_ns(pool.path_of(refs[0].key), int64_t(946684800) * 1000000000ll);
+    check(pool.evict_ghosts(0) == 0 && fs::exists(pool.path_of(refs[0].key)), "a ghost stays when no room is wanted, however old");
+    uint64_t freed = 0;
+    check(pool.evict_ghosts(1, {}, &freed) == 1 && freed == chunk_file_size(5000), "a ghost goes when room is wanted");
+    check(!fs::exists(pool.path_of(refs[0].key)) && pool.bytes() == total - chunk_file_size(5000) && pool.ghost_count() == 0,
+          "file removed, bytes updated");
+    // oldest first, and only as many as the room needs
     pool.unref(&refs[1], 1);
-    check(pool.sweep(false, true, nullptr) == 1 && pool.count() == 1, "pressure ignores the grace");
-    // a pin is one more ref
+    check(pool.evict_ghosts(1) == 1 && pool.count() == 1 && pool.refs_of(refs[2].key) == 1, "a ghost goes, a referenced chunk never");
+    // a pin is one more ref: a pinned chunk is not a ghost
     pool.ref(&refs[2], 1);
     pool.unref(&refs[2], 1);
-    check(pool.sweep(false, true, nullptr) == 0 && pool.refs_of(refs[2].key) == 1, "a pinned chunk stays");
-    // old file, then unref: the grace starts at the release (a chunk written long ago survives take + continue)
-    fx.clock += 100000;
+    check(pool.evict_ghosts(UINT64_MAX) == 0 && pool.refs_of(refs[2].key) == 1, "a pinned chunk stays");
     pool.unref(&refs[2], 1);
-    check(pool.sweep(false, false, nullptr) == 0, "grace counts from the release, not from the write");
-    // shared: only unnamed old chunks, re-checked on the disk
-    {
-        std::set<ChunkKey> named{refs[2].key};
-        fx.clock += 1000;
-        // the file's real mtime is the injected clock (stamped), so the re-check agrees
-        check(pool.sweep(true, true, &named) == 0 && pool.count() == 1, "shared: a chunk another manifest names stays");
-        named.clear();
-        check(pool.sweep(true, false, &named) == 1 && pool.count() == 0, "shared: unnamed and old: removed");
-    }
-    // a shared sweep keeps a chunk younger than the grace even under pressure (a replica's chunk, not yet named)
-    {
-        std::vector<uint8_t> raw = fill_vec(777, 90);
-        ChunkRef r;
-        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "put");
-        pool.unref(&r, 1);
-        std::set<ChunkKey> none;
-        check(pool.sweep(true, true, &none) == 0, "shared: young unnamed chunk survives pressure");
-        fx.clock += 601;
-        check(pool.sweep(true, false, &none) == 1, "shared: gone after the grace");
-    }
+    check(pool.ghost_count() == 1 && pool.evict_ghosts(UINT64_MAX) == 1 && pool.count() == 0 && pool.bytes() == 0 && pool.ghost_bytes() == 0,
+          "released, it is evicted like any ghost");
     // open() indexes what is there, removes old temp files, and remove_all clears the folder
     {
         std::vector<uint8_t> raw = fill_vec(1234, 91);
@@ -593,14 +584,17 @@ void test_pool_lifecycle() {
         const fs::path shard = fx.pool_dir / r.key.hex().substr(0, 2);
         const fs::path old_tmp = shard / ".tmp-0000000000000001", young_tmp = shard / ".tmp-0000000000000002";
         spit(old_tmp, {1}); spit(young_tmp, {2});
-        struct timespec ts[2] = {{0, UTIME_OMIT}, {(time_t) (fx.clock - 700), 0}};
-        ::utimensat(AT_FDCWD, old_tmp.c_str(), ts, 0);
-        ts[1].tv_sec = (time_t) fx.clock;
+        const fs::path old_del = shard / ".del-0000000000000003";   // an eviction's victim whose engine died
+        spit(old_del, {3});
+        { struct timespec dts[2] = {{0, UTIME_OMIT}, {(time_t) (std::time(nullptr) - 700), 0}}; ::utimensat(AT_FDCWD, old_del.c_str(), dts, 0); }
+        struct timespec ts[2] = {{0, UTIME_OMIT}, {(time_t) (std::time(nullptr) - 700), 0}};
+        ::utimensat(AT_FDCWD, old_tmp.c_str(), ts, 0);   // (crash hygiene, not retention: the one time-based rule left)
+        ts[1].tv_sec = (time_t) std::time(nullptr);
         ::utimensat(AT_FDCWD, young_tmp.c_str(), ts, 0);
         fs::create_directories(fx.pool_dir / "zz");           // not a shard
         spit(shard / "README", {1});                           // not a chunk
         fx.make_pool(true);
-        check(!fs::exists(old_tmp) && fs::exists(young_tmp), "open removes only the temporary files older than 10 minutes");
+        check(!fs::exists(old_tmp) && !fs::exists(old_del) && fs::exists(young_tmp), "open removes only the temporary files older than 10 minutes (an old .del- leftover too)");
         check(fx.pool->count() == 1 && fx.pool->refs_of(r.key) == 0 && fx.pool->bytes() == chunk_file_size(1234), "open indexes the chunks as ghosts");
         // a put of the same bytes in the new pool is a hit
         ChunkRef again;
@@ -636,7 +630,7 @@ void test_failures() {
     check(!fx.pool->put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err) || info.direct_io, "a failed writeback (buffered mode only)");
     fx.fault = nullptr;
     // the free-space preflight
-    fx.make_pool(true, 600, UINT64_MAX / 2);
+    fx.make_pool(true, UINT64_MAX / 2);
     const size_t before_files = count_files(fx.pool_dir, ".chk");
     std::vector<uint8_t> fresh = fill_vec(9001, 4);
     check(!fx.pool->put(ChunkKind::kv_slab, fresh.data(), fresh.size(), 0, r, info, err) && info.error_kind == SessionError::storage, "the free-space preflight refuses");
@@ -1851,7 +1845,7 @@ void test_pipeline_failures(ChunkCodec codec) {
         {   // not enough space for a chunk
             Fx fx("pf-space");
             fx.codec = codec;
-            fx.make_pool(true, 600, ~uint64_t(0) >> 2);
+            fx.make_pool(true, ~uint64_t(0) >> 2);
             const Pw p = write_with(fx, img, "m.bin", workers);
             check(!p.ok && fx.pool->live_bytes() == 0 && p.w.st.error == SessionError::storage, "no space: a storage refusal, refs back");
         }
@@ -2077,40 +2071,35 @@ void test_review_fixes() {
         check(asked_max >= std::max(chunked_read_peak_bytes(rt, 1, 64, max_raw), chunked_read_peak_bytes(rt, 1, 64)),
               "peak: the read is asked for the manifest's largest chunk when that is more than the guess");
     }
-    {   // shared: a chunk another engine wrote is adopted with the file's own age, so the first hit touches it
-        Fx fx("adopt", true, 600);
+    {   // every hit touches the file (the mtime is the persisted LRU order, nanoseconds): a chunk another engine made
+        // long ago is as young as the last hit, however many hits there were
+        Fx fx("adopt", true);
         ChunkPoolOptions o;
         o.dir = fx.pool_dir.string();
-        o.grace_s = 600;
-        o.clock_s = [&fx] { return fx.clock; };
         ChunkPool b(o);   // engine B: opened before A wrote
         check(b.open(err), "adopt: B opens");
         std::vector<uint8_t> raw = fill_vec(4000, 51);
         ChunkRef r;
         check(fx.pool->put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "adopt: A writes");
-        const int64_t written = fx.clock;
-        fx.clock += 5000;   // hours later by the grace's measure
+        const int64_t old_ns = now_ns() - int64_t(5000) * 1000000000ll;
+        set_mtime_ns(b.path_of(r.key), old_ns);
         b.ref(&r, 1);       // B finds it through a manifest
+        check(mtime_ns_of(b.path_of(r.key)) == old_ns, "adopt: a manifest ref does not touch the file");
         ChunkRef again;
         check(b.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, again, info, err) && info.hit, "adopt: B hits it");
-        struct stat st {};
-        check(::stat(b.path_of(r.key).c_str(), &st) == 0 && (int64_t) st.st_mtime == fx.clock && (int64_t) st.st_mtime > written,
-              "adopt: the hit touched the file (its age was the file's, not the moment of adoption)");
-    }
-    {   // the shared sweep re-checks the size on the disk: a file that is not the one that was indexed stays
-        Fx fx("sweepsize", true, 600);
-        ChunkPool& pool = *fx.pool;
-        std::vector<uint8_t> raw = fill_vec(5000, 61);
-        ChunkRef r;
-        check(pool.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, r, info, err), "sweep size: put");
-        pool.unref(&r, 1);
-        fx.clock += 5000;
-        std::vector<uint8_t> other(chunk_file_size(5000) + 2 * kChunkAlign, 7);   // another size under the name
-        spit(pool.path_of(r.key), other);
-        struct timespec ts[2] = {{0, UTIME_OMIT}, {(time_t) (fx.clock - 3000), 0}};
-        ::utimensat(AT_FDCWD, pool.path_of(r.key).c_str(), ts, 0);
-        std::set<ChunkKey> none;
-        check(pool.sweep(true, false, &none) == 0 && fs::exists(pool.path_of(r.key)), "sweep size: an old unnamed file of another size is not unlinked");
+        check(mtime_ns_of(b.path_of(r.key)) > now_ns() - int64_t(60) * 1000000000ll, "adopt: the hit touched the file");
+        set_mtime_ns(b.path_of(r.key), old_ns);   // and the next hit touches it again (no once-per-interval throttle)
+        check(b.put(ChunkKind::kv_slab, raw.data(), raw.size(), 0, again, info, err) && info.hit &&
+              mtime_ns_of(b.path_of(r.key)) > now_ns() - int64_t(60) * 1000000000ll, "adopt: every hit touches the file");
+        // a read touches it too
+        set_mtime_ns(b.path_of(r.key), old_ns);
+        std::vector<uint8_t> dst(r.raw_len);
+        check(b.get(ChunkKind::kv_slab, r, dst.data(), dst.size(), err) && mtime_ns_of(b.path_of(r.key)) > now_ns() - int64_t(60) * 1000000000ll,
+              "adopt: a read touches the file");
+        // and a release does (the ghost is the newest)
+        set_mtime_ns(b.path_of(r.key), old_ns);
+        b.unref(&r, 1); b.unref(&again, 1); b.unref(&again, 1);
+        check(b.refs_of(r.key) == 0 && mtime_ns_of(b.path_of(r.key)) > now_ns() - int64_t(60) * 1000000000ll, "adopt: a release touches the file");
     }
     {   // before_publish: a chunk gone before the manifest fails the write and publishes nothing
         Fx fx("publish");
@@ -2214,6 +2203,301 @@ void test_review_fixes2() {
 #endif
 }
 
+
+// ------------------------------------------------------------------------------------------------ LRU, eviction, leases
+
+bool put_bytes(ChunkPool& pool, const std::vector<uint8_t>& raw, ChunkRef& r, ChunkPutInfo& info, ChunkLease* lease = nullptr) {
+    ChunkBuffer buf;
+    std::string err;
+    if (!buf.reserve(raw.size())) return false;
+    if (!raw.empty()) std::memcpy(buf.payload(), raw.data(), raw.size());
+    return pool.put_buffer(ChunkKind::kv_slab, buf, raw.size(), 0, r, info, err, false, nullptr, lease);
+}
+
+void test_lru() {
+    Fx fx("lru", true);
+    ChunkPool& pool = *fx.pool;
+    std::string err;
+    ChunkPutInfo info;
+    constexpr int N = 5;
+    ChunkRef r[N];
+    std::vector<uint8_t> raw[N];
+    for (int i = 0; i < N; ++i) {
+        raw[i] = fill_vec(5000 + (size_t) i * 100, 70 + i);
+        check(pool.put(ChunkKind::kv_slab, raw[i].data(), raw[i].size(), 0, r[i], info, err), "lru: put");
+    }
+    // released in the order 2, 0, 4, 1, 3: that is the eviction order
+    for (int i : {2, 0, 4, 1, 3}) pool.unref(&r[i], 1);
+    auto order = [&]() {
+        std::vector<int> o;
+        for (const auto& k : pool.ghosts_oldest_first())
+            for (int i = 0; i < N; ++i) if (k == r[i].key) o.push_back(i);
+        return o;
+    };
+    check((order() == std::vector<int>{2, 0, 4, 1, 3}), "lru: ghosts are ordered by their release");
+    // a hit on a ghost makes it the newest: 0 is hit (pinned, then released again)
+    {
+        ChunkRef again;
+        check(put_bytes(pool, raw[0], again, info) && info.hit, "lru: a hit");
+        check((order() == std::vector<int>{2, 4, 1, 3}), "lru: a pinned chunk leaves the ghosts");
+        pool.unref(&again, 1);
+        check((order() == std::vector<int>{2, 4, 1, 3, 0}), "lru: a hit makes the chunk the newest ghost");
+    }
+    // a read of a ghost makes it the newest too
+    {
+        std::vector<uint8_t> dst(r[2].raw_len);
+        check(pool.get(ChunkKind::kv_slab, r[2], dst.data(), dst.size(), err), "lru: a read");
+        check((order() == std::vector<int>{4, 1, 3, 0, 2}), "lru: a read makes the chunk the newest ghost");
+    }
+    // eviction is oldest first and takes only what the room needs
+    uint64_t freed = 0;
+    check(pool.evict_ghosts(1, {}, &freed) == 1 && freed == chunk_file_size(5400) && !fs::exists(pool.path_of(r[4].key)) &&
+          (order() == std::vector<int>{1, 3, 0, 2}), "lru: the oldest goes first, one is enough for 1 byte");
+    check(pool.evict_ghosts(chunk_file_size(5100) + 1, {}, &freed) == 2 && !fs::exists(pool.path_of(r[1].key)) &&
+          !fs::exists(pool.path_of(r[3].key)) && fs::exists(pool.path_of(r[0].key)) && fs::exists(pool.path_of(r[2].key)),
+          "lru: the room asked for decides how many go (two oldest)");
+    // a pinned chunk (a release that is then ref()'d) survives an eviction of everything, during a read
+    pool.ref(&r[0], 1);
+    {
+        std::vector<uint8_t> dst(r[0].raw_len);
+        const size_t gone = pool.evict_ghosts(UINT64_MAX);   // takes 2, never 0
+        check(gone == 1 && fs::exists(pool.path_of(r[0].key)) && pool.get(ChunkKind::kv_slab, r[0], dst.data(), dst.size(), err) &&
+              std::memcmp(dst.data(), raw[0].data(), dst.size()) == 0, "lru: a pinned chunk survives the eviction and reads back");
+    }
+    // restart: the order is rebuilt from the files' mtimes (nanoseconds), not from the order they were released in
+    pool.unref(&r[0], 1);
+    ChunkRef x, y, z;
+    std::vector<uint8_t> rx = fill_vec(6000, 81), ry = fill_vec(6100, 82), rz = fill_vec(6200, 83);
+    check(put_bytes(pool, rx, x, info) && put_bytes(pool, ry, y, info) && put_bytes(pool, rz, z, info), "lru: three more chunks");
+    pool.unref(&x, 1); pool.unref(&y, 1); pool.unref(&z, 1);
+    const int64_t base = now_ns() - int64_t(1000) * 1000000000ll;
+    set_mtime_ns(pool.path_of(z.key), base);            // same second: nanoseconds break the tie
+    set_mtime_ns(pool.path_of(x.key), base + 2000);
+    set_mtime_ns(pool.path_of(y.key), base + 1000);
+    set_mtime_ns(pool.path_of(r[0].key), base + 3000000000ll);
+    fx.make_pool(true);
+    {
+        std::vector<ChunkKey> want{z.key, y.key, x.key, r[0].key};
+        check(fx.pool->ghosts_oldest_first() == want && fx.pool->ghost_count() == 4, "restart: the ghosts are ordered by the files' mtimes");
+        check(fx.pool->evict_ghosts(1) == 1 && !fs::exists(fx.pool->path_of(z.key)) && fs::exists(fx.pool->path_of(y.key)),
+              "restart: the oldest by mtime goes first");
+    }
+}
+
+void test_eviction_races() {
+    Fx fx("evrace", true);
+    ChunkPool& pool = *fx.pool;
+    std::string err;
+    ChunkPutInfo info;
+    // EEXIST then evicted: another writer published the name, then a deleter took it before the hit was looked at again.
+    // The writer must write the chunk again (a miss), never report a hit on a file that is gone.
+    {
+        ChunkPoolOptions o = pool.options();
+        o.fault = nullptr;
+        ChunkPool other(o);   // the "other engine's" view of the same folder
+        check(other.open(err), "eexist: other opens");
+        std::vector<uint8_t> raw = fill_vec(7000, 91);
+        int validates = 0, renames = 0;
+        ChunkRef r, rb;
+        fx.fault = [&](const char* step) {
+            if (!std::strcmp(step, "chunk_rename") && ++renames == 1) {
+                // the other writer wins the name now, and releases it (a ghost of its own)
+                ChunkPutInfo ib;
+                put_bytes(other, raw, rb, ib);
+                other.unref(&rb, 1);
+            }
+            if (!std::strcmp(step, "chunk_validate") && ++validates == 2) {
+                // between the EEXIST and the second look: the other engine's limit evicts that ghost
+                other.evict_ghosts(UINT64_MAX);
+            }
+            return 0;
+        };
+        // (the pool under test has to be one whose faults fire: Fx's)
+        const bool ok = put_bytes(pool, raw, r, info);
+        fx.fault = nullptr;
+        check(renames == 2 && validates >= 2, "eexist: the race really happened (EEXIST, then the second look)");
+        check(ok && !info.hit && fs::exists(pool.path_of(r.key)) && pool.refs_of(r.key) == 1, "eexist: an evicted chunk is written again");
+        std::vector<uint8_t> dst(r.raw_len);
+        check(pool.get(ChunkKind::kv_slab, r, dst.data(), dst.size(), err) && std::memcmp(dst.data(), raw.data(), dst.size()) == 0,
+              "eexist: and reads back");
+        pool.unref(&r, 1);
+        pool.evict_ghosts(UINT64_MAX);
+    }
+    // a hit pins the chunk: an eviction right after the hit cannot take it
+    {
+        std::vector<uint8_t> raw = fill_vec(7100, 92);
+        ChunkRef r, h;
+        check(put_bytes(pool, raw, r, info), "pin: put");
+        pool.unref(&r, 1);
+        check(put_bytes(pool, raw, h, info) && info.hit, "pin: hit on a ghost");
+        check(pool.evict_ghosts(UINT64_MAX) == 0 && fs::exists(pool.path_of(h.key)), "pin: the hit chunk cannot be evicted");
+        pool.unref(&h, 1);
+    }
+}
+
+void test_shared_eviction() {
+    Fx fx("shared", true);
+    std::string err;
+    ChunkPutInfo info;
+    auto shared_pool = [&](ChunkPool*& out) {
+        ChunkPoolOptions o;
+        o.dir = fx.pool_dir.string();
+        o.shared = true;
+        out = new ChunkPool(o);
+        check(out->open(err), "shared: pool opens");
+    };
+    ChunkPool *a = nullptr, *b = nullptr;
+    shared_pool(a);
+    shared_pool(b);
+    std::unique_ptr<ChunkPool> ga(a), gb(b);
+    auto make_ghost = [&](ChunkPool& pool, uint64_t seed, size_t n, ChunkRef& r) {
+        std::vector<uint8_t> raw = fill_vec(n, seed);
+        check(put_bytes(pool, raw, r, info), "shared: put");
+        pool.unref(&r, 1);
+        return raw;
+    };
+    const std::function<bool(std::set<ChunkKey>&)> none = [](std::set<ChunkKey>&) { return true; };
+    // 1. a chunk another engine's manifest names is never deleted
+    {
+        ChunkRef r;
+        make_ghost(*a, 101, 5000, r);
+        std::set<ChunkKey> named{r.key};
+        check(a->evict_ghosts(UINT64_MAX, [&](std::set<ChunkKey>& o) { o.insert(named.begin(), named.end()); return true; }) == 0 &&
+              fs::exists(a->path_of(r.key)) && a->ghost_count() == 1, "shared: a chunk another manifest names stays");
+        check(a->evict_ghosts(UINT64_MAX, none) == 1 && !fs::exists(a->path_of(r.key)), "shared: unnamed: evicted");
+    }
+    // 2. a chunk named by a live lease is never deleted; released, it can go
+    {
+        ChunkRef r;
+        const auto raw = make_ghost(*a, 102, 5100, r);
+        auto lease = b->begin_lease();
+        check(lease != nullptr, "shared: a lease");
+        lease->announce(r.key);
+        check(a->evict_ghosts(UINT64_MAX, none) == 0 && fs::exists(a->path_of(r.key)), "shared: a leased chunk stays");
+        lease.reset();
+        check(a->evict_ghosts(UINT64_MAX, none) == 1 && !fs::exists(a->path_of(r.key)), "shared: after the lease, it goes");
+        check(count_prefixed(fx.pool_dir, ".lease-") == 0, "shared: the lease file is gone");
+    }
+    // 3. a stale lease (its process died: nobody holds the lock) protects nothing and is removed
+    {
+        ChunkRef r;
+        make_ghost(*a, 103, 5200, r);
+        const fs::path dead = fx.pool_dir / ".lease-deadbeefdeadbeef";
+        spit(dead, std::vector<uint8_t>(r.key.b.begin(), r.key.b.end()));
+        check(a->evict_ghosts(UINT64_MAX, none) == 1 && !fs::exists(a->path_of(r.key)) && !fs::exists(dead), "shared: a stale lease does not protect, and is removed");
+    }
+    // 4. renamed away, then a lease or manifest names it in the second look: put back
+    {
+        ChunkRef r;
+        make_ghost(*a, 104, 5300, r);
+        int calls = 0;
+        const bool survived = a->evict_ghosts(UINT64_MAX, [&](std::set<ChunkKey>& o) {
+            if (++calls == 2) o.insert(r.key);   // the first snapshot (S1) is empty, the second (S2) names it
+            return true;
+        }) == 0;
+        check(survived && fs::exists(a->path_of(r.key)) && a->ghost_count() == 1 && a->bytes() == chunk_file_size(5300) &&
+              count_prefixed(fx.pool_dir / r.key.hex().substr(0, 2), ".del-") == 0, "shared: named in the second look: put back, nothing left aside");
+        check(a->evict_ghosts(UINT64_MAX, none) == 1, "shared: and then gone when nobody names it");
+    }
+    // 4b. the lease that appears between the deleter's first lease read and its manifest read (a take: lease first, then
+    // its index goes): the second lease read catches it, so the chunk is never renamed away at all
+    {
+        ChunkRef r;
+        make_ghost(*a, 106, 5350, r);
+        int calls = 0;
+        bool present_at_second_look = true;
+        std::unique_ptr<ChunkLease> lease;
+        const size_t n = a->evict_ghosts(UINT64_MAX, [&](std::set<ChunkKey>&) {
+            if (++calls == 1) { lease = b->begin_lease(); lease->announce(r.key); }   // after the first lease read
+            else present_at_second_look = fs::exists(a->path_of(r.key));            // (a second look, if the victim got that far: the name was never taken)
+            return true;
+        });
+        check(n == 0 && calls >= 1 && present_at_second_look && fs::exists(a->path_of(r.key)) && a->ghost_count() == 1,
+              "shared: a lease taken between the first lease read and the manifest read still protects (lease, manifests, lease: the victims are picked after the second lease read)");
+        lease.reset();
+        a->evict_ghosts(UINT64_MAX, none);
+    }
+    // 4c. when the manifests cannot be read, nothing is deleted and the caller is told
+    {
+        ChunkRef r;
+        make_ghost(*a, 107, 5360, r);
+        bool undecided = false;
+        check(a->evict_ghosts(UINT64_MAX, [](std::set<ChunkKey>&) { return false; }, nullptr, &undecided) == 0 && undecided &&
+              fs::exists(a->path_of(r.key)), "shared: manifests that cannot be read: nothing is deleted, undecided is reported");
+        a->evict_ghosts(UINT64_MAX, none);
+    }
+    // 4d. the other engines' referenced chunks at the front of the order do not use up the rounds: an unreferenced one
+    // behind more than 64 of them is still found and freed
+    {
+        std::vector<ChunkRef> front(70);
+        std::set<ChunkKey> named;
+        for (size_t i = 0; i < front.size(); ++i) { make_ghost(*a, 5000 + i, 100, front[i]); named.insert(front[i].key); }
+        ChunkRef young;
+        make_ghost(*a, 6000, 100, young);
+        uint64_t freed = 0;
+        bool undecided = false;
+        const size_t n = a->evict_ghosts(1, [&](std::set<ChunkKey>& o) { o.insert(named.begin(), named.end()); return true; }, &freed, &undecided);
+        check(n == 1 && freed > 0 && !undecided && !fs::exists(a->path_of(young.key)) && fs::exists(a->path_of(front[0].key)),
+              "shared: referenced chunks at the front of the order are skipped, the unreferenced one behind them goes");
+        a->evict_ghosts(UINT64_MAX, none);
+    }
+    // 4e. a manifest's failure kind: a file that cannot be opened is transient, a file that was read and is bad is not
+    {
+        std::vector<ChunkRef> refs;
+        uint64_t mb = 0;
+        std::string why;
+        bool tr = false;
+        const std::string bad = (fx.pool_dir / "bad.man").string();
+        { std::ofstream f(bad, std::ios::binary); f << "STRSESS\x02 not a manifest"; }
+        check(!chunked_manifest_refs(bad, kId, refs, mb, why, &tr) && !tr, "manifest refs: a damaged file is a definite failure, not transient");
+        check(!chunked_manifest_refs((fx.pool_dir / "nowhere.man").string(), kId, refs, mb, why, &tr) && tr,
+              "manifest refs: a file that cannot be opened is a transient failure");
+        fs::remove(bad);
+    }
+    // 5. a writer racing the deleter: the chunk is renamed away, the writer (with its lease) finds nothing and writes it again
+    {
+        ChunkRef r;
+        const auto raw = make_ghost(*a, 105, 5400, r);
+        ChunkRef w;
+        ChunkPutInfo wi;
+        int calls = 0;
+        auto lease = b->begin_lease();
+        size_t n = a->evict_ghosts(UINT64_MAX, [&](std::set<ChunkKey>& o) {
+            (void) o;
+            if (++calls == 2) put_bytes(*b, raw, w, wi, lease.get());   // after the rename-away, before the second look
+            return true;
+        });
+        check(!wi.hit && fs::exists(a->path_of(r.key)) && b->refs_of(r.key) == 1, "shared: the racing writer wrote the chunk again");
+        std::vector<uint8_t> dst(w.raw_len);
+        check(b->get(ChunkKind::kv_slab, w, dst.data(), dst.size(), err) && std::memcmp(dst.data(), raw.data(), dst.size()) == 0 && n <= 1,
+              "shared: the rewritten chunk reads back");
+        lease.reset();
+        b->unref(&w, 1);
+        a->evict_ghosts(UINT64_MAX, none);
+        b->evict_ghosts(UINT64_MAX, none);
+    }
+    // 6. the census: chunks another engine wrote are ghosts here, ordered by mtime; the ones that vanished are forgotten
+    {
+        fs::remove_all(fx.pool_dir);
+        ga.reset(); gb.reset();
+        shared_pool(a);
+        shared_pool(b);
+        ga.reset(a); gb.reset(b);
+        ChunkRef r1, r2;
+        make_ghost(*a, 111, 5000, r1);
+        make_ghost(*a, 112, 5100, r2);
+        set_mtime_ns(a->path_of(r1.key), now_ns() - int64_t(100) * 1000000000ll);
+        set_mtime_ns(a->path_of(r2.key), now_ns() - int64_t(200) * 1000000000ll);
+        check(b->count() == 0, "census: B knows nothing yet");
+        b->census();
+        check(b->count() == 2 && b->ghost_count() == 2 && b->bytes() == chunk_file_size(5000) + chunk_file_size(5100) &&
+              (b->ghosts_oldest_first() == std::vector<ChunkKey>{r2.key, r1.key}), "census: the other engine's chunks are ghosts, oldest mtime first");
+        a->evict_ghosts(UINT64_MAX, none);
+        b->census();
+        check(b->count() == 0 && b->bytes() == 0, "census: chunks that are gone are forgotten");
+    }
+}
+
 int main() {
     struct Cleanup {
         ~Cleanup() {
@@ -2226,6 +2510,9 @@ int main() {
     test_chunk_files(true);
     test_chunk_corruption();
     test_pool_lifecycle();
+    test_lru();
+    test_eviction_races();
+    test_shared_eviction();
     test_failures();
     test_review_fixes();
     test_review_fixes2();

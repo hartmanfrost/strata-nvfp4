@@ -141,6 +141,21 @@ class Dialogs(unittest.TestCase):
           "conversation_disk_chunk_tokens": 256, "conversation_disk_codec": "zstd:3",
           "conversation_disk_live": "auto", "conversation_disk_live_gap": 2048}
 
+    def test_the_one_storage_limit_defaults_to_10_gb_everywhere(self):
+        # the engine's default (kConversationDiskDefaultMib), its --help text and the page's placeholder agree
+        import re
+        hdr = (ROOT / "include" / "strata" / "core" / "conversation_disk.hpp").read_text(encoding="utf-8")
+        mib = int(re.search(r"kConversationDiskDefaultMib\s*=\s*(\d+)", hdr).group(1))
+        self.assertEqual(mib, 10240)
+        gen = (ROOT / "src" / "program" / "generate.cpp").read_text(encoding="utf-8")
+        self.assertIn("conversation_disk_mib = strata::core::kConversationDiskDefaultMib", gen)   # no flag: the constant
+        self.assertIn("(default 10240 = 10 GB)", gen)
+        self.assertNotIn("conversation_disk_mib = 32768", gen)
+        self.assertEqual(runconfig.DEFAULTS["conversation_disk_mib"], "default: %d" % mib)
+        keys = {k["key"]: k for k in runconfig.view(CFG, "x.json")["keys"]}
+        self.assertEqual(keys["conversation_disk_mib"]["default"], "default: 10240")
+        self.assertIn("10240", [k for k in runconfig.EDITABLE if k[0] == "conversation_disk_mib"][0][2])
+
     def test_on_and_off(self):
         new, changed = runconfig.apply(CFG, self.ON)
         self.assertEqual(changed, list(self.ON))

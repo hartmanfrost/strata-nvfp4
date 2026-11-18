@@ -69,9 +69,10 @@ EDITABLE = [
      "Keep dialogs on the disk too: a folder on a fast SSD (empty: off). A dialog the RAM above has no room for is "
      "written there and read back (100K tokens: 1 s instead of 11-12 s read again). Needs the RAM above"),
     ("conversation_disk_mib", ("arg", "--conversation-disk-mib"),
-     "Disk space for those dialogs, in MiB (engine default 32768)"),
+     "The disk space limit for those dialogs, in MiB (engine default 10240). Over it the oldest dialogs go first and the "
+     "engine log says WARNING [disk-limit]: raise it"),
     ("conversation_disk_persist", ("arg", "--conversation-disk-persist", "flag"),
-     "Keep the dialogs on the disk for the next start (off: removed when the model stops, and after 30 minutes). "
+     "Keep the dialogs on the disk for the next start (off: removed when the model stops, and, one file per dialog, after 30 minutes). "
      "Saved after 60 s without requests, so closing Strata's window loses at most what came after"),
     ("conversation_disk_chunked", ("arg", "--conversation-disk-chunked", "flag"),
      "Write the disk's dialogs as a small manifest plus deduplicated chunks: a dialog that goes on writes only what "
@@ -107,7 +108,7 @@ SECTIONS = {"sampling.temperature": "Sampling defaults", "reasoning_budget_token
             "idle_unload_s": "Loading and the engine", "parallel": "Dialogs", "max_context": "Context"}
 # what an empty field means, where "default" says too little (the page's placeholder / first choice)
 DEFAULTS = {"conversation_cache_slots": "default: 4", "conversation_cache_mib": "off", "conversation_disk_dir": "off",
-            "conversation_disk_mib": "default: 32768", "conversation_disk_persist": "default: off",
+            "conversation_disk_mib": "default: 10240", "conversation_disk_persist": "default: off",
             "conversation_disk_chunked": "default: off", "conversation_disk_chunk_tokens": "default: 512",
             "conversation_disk_codec": "default: raw", "conversation_disk_live": "default: always",
             "conversation_disk_live_gap": "default: 4096", "update_check": "default: on"}

@@ -28,6 +28,7 @@
 #include <malloc.h>
 #else
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -322,30 +323,88 @@ struct ChunkPool::Impl {
         uint64_t file_bytes = 0;
         uint32_t refs = 0, stored_len = 0;
         bool stored_known = false;
-        int64_t stamp = 0;          // last touch (clock domain of now())
+        uint64_t seq = 0;           // last use (release, hit, read): wall-clock nanoseconds, strictly increasing; a ghost's LRU key
     };
     explicit Impl(ChunkPoolOptions opt) : o(std::move(opt)) {}
     ChunkPoolOptions o;
     mutable std::mutex mu;
     std::unordered_map<ChunkKey, Info, KeyHash> idx;
     uint64_t bytes = 0;
+    uint64_t ghost_bytes = 0;           // file bytes of the unreferenced chunks (exactly ghost_lru's)
+    uint64_t last_tick = 0;
+    std::set<std::pair<uint64_t, ChunkKey>> ghost_lru;   // every chunk with refs == 0, oldest (smallest seq) first
     std::set<std::string> touched;      // shard names; "" = the pool folder itself
     std::mutex sync_mu;                 // one sync_touched_shards at a time, held until its fsyncs are done
     AdaptiveSkip skip;                  // which kinds of data the codec is tried on
     bool opened = false;
 
-    int64_t now() const { return o.clock_s ? o.clock_s() : (int64_t) std::time(nullptr); }
+    // (mu held) a strictly increasing wall-clock nanosecond stamp: comparable with the files' mtimes, so the ghosts
+    // this process released and the ones it found on the disk (a restart, another engine) share one order
+    uint64_t tick() {
+        const uint64_t t = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        last_tick = t > last_tick ? t : last_tick + 1;
+        return last_tick;
+    }
+    // (mu held) the LRU bookkeeping: a ghost is in ghost_lru exactly while refs == 0
+    void ghost_add(const ChunkKey& k, Info& e, uint64_t seq) {
+        e.seq = seq;
+        ghost_lru.insert({seq, k});
+        ghost_bytes += e.file_bytes;
+    }
+    void ghost_del(const ChunkKey& k, const Info& e) {
+        if (ghost_lru.erase({e.seq, k})) ghost_bytes -= std::min(ghost_bytes, e.file_bytes);
+    }
+    void ref_inc(const ChunkKey& k, Info& e) {
+        if (e.refs == 0) ghost_del(k, e);
+        ++e.refs;
+    }
+    // refs 1 -> 0: the chunk becomes the newest ghost
+    void ref_dec(const ChunkKey& k, Info& e) {
+        if (e.refs == 0) return;
+        if (--e.refs == 0) ghost_add(k, e, tick());
+    }
+    // forgets the index entry (the file is gone or being removed): bytes and the ghost set follow
+    std::unordered_map<ChunkKey, Info, KeyHash>::iterator drop(std::unordered_map<ChunkKey, Info, KeyHash>::iterator it) {
+        if (it->second.refs == 0) ghost_del(it->first, it->second);
+        bytes -= std::min(bytes, it->second.file_bytes);
+        return idx.erase(it);
+    }
     std::string path_of(const ChunkKey& k) const { return o.dir + "/" + shard_of(k) + "/" + k.hex() + ".chk"; }
     std::string shard_dir(const ChunkKey& k) const { return o.dir + "/" + shard_of(k); }
 
 #ifndef _WIN32
-    // sets the file's mtime to now() (in the injected clock's domain when there is one)
+    // sets the file's mtime to now: the persisted LRU order (a restart, other engines' censuses read it back)
     void stamp_file(const std::string& path) const {
         struct timespec ts[2];
         ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_OMIT;
-        if (o.clock_s) { ts[1].tv_sec = (time_t) now(); ts[1].tv_nsec = 0; }
-        else { ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_NOW; }
+        ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_NOW;
         ::utimensat(AT_FDCWD, path.c_str(), ts, 0);
+    }
+
+    // every key the live leases of the folder name; a lease whose flock can be taken belongs to a dead process: removed
+    void read_leases(std::set<ChunkKey>& out) const {
+        std::error_code ec;
+        for (const auto& f : fs::directory_iterator(o.dir, ec)) {
+            const std::string name = f.path().filename().string();
+            if (name.rfind(".lease-", 0) != 0 || name.rfind(".lease-tmp-", 0) == 0) continue;
+            Fd fd(::open(f.path().c_str(), O_RDONLY | O_CLOEXEC));
+            if (!fd) continue;
+            if (::flock(fd.get(), LOCK_EX | LOCK_NB) == 0) { ::unlink(f.path().c_str()); continue; }   // stale
+            uint8_t buf[16 * 64];
+            off_t off = 0;
+            for (;;) {
+                const ssize_t n = ::pread(fd.get(), buf, sizeof buf, off);
+                if (n <= 0) break;
+                for (ssize_t i = 0; i + 16 <= n; i += 16) {
+                    ChunkKey k;
+                    std::memcpy(k.b.data(), buf + i, 16);
+                    out.insert(k);
+                }
+                off += (n / 16) * 16;
+                if (n < (ssize_t) sizeof buf) break;
+            }
+        }
     }
 
     // what a look at an existing chunk file found: a valid chunk, no file, a file that is definitely not this chunk
@@ -403,7 +462,7 @@ struct ChunkPool::Impl {
         if (::rename(path.c_str(), aside.c_str()) != 0) ::unlink(path.c_str());
         std::lock_guard<std::mutex> g(mu);
         auto it = idx.find(key);
-        if (it != idx.end() && it->second.refs == 0) { bytes -= std::min(bytes, it->second.file_bytes); idx.erase(it); }
+        if (it != idx.end() && it->second.refs == 0) drop(it);
     }
 
     bool shard_ready(const ChunkKey& key, std::string& error, SessionError& kind) {
@@ -452,7 +511,6 @@ struct ChunkPool::Impl {
         }
         if (!fd.close()) { e = errno; cleanup(); info.error_kind = errno_kind(e); error = std::string("closing a chunk: ") + std::strerror(e); return false; }
         info.direct_io = direct;
-        if (o.clock_s) stamp_file(dir + "/" + tmp);
         e = injected(o.fault, "chunk_rename");
         const std::string final_name = key.hex() + ".chk";
         if (!e) {
@@ -484,6 +542,18 @@ struct ChunkPool::Impl {
 #endif
 };
 
+#ifndef _WIN32
+namespace {
+uint64_t mtime_ns(const struct stat& st) {
+#ifdef __APPLE__
+    return (uint64_t) st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t) st.st_mtimespec.tv_nsec;
+#else
+    return (uint64_t) st.st_mtim.tv_sec * 1000000000ull + (uint64_t) st.st_mtim.tv_nsec;
+#endif
+}
+}  // namespace
+#endif
+
 ChunkPool::ChunkPool(ChunkPoolOptions o) : p_(new Impl(std::move(o))) {}
 ChunkPool::~ChunkPool() = default;
 const ChunkPoolOptions& ChunkPool::options() const { return p_->o; }
@@ -491,13 +561,21 @@ std::string ChunkPool::path_of(const ChunkKey& k) const { return p_->path_of(k);
 
 #ifdef _WIN32
 bool ChunkPool::open(std::string& error) { error = "the chunked disk format is POSIX only"; return false; }
-bool ChunkPool::put_buffer(ChunkKind, ChunkBuffer&, size_t, uint8_t, ChunkRef&, ChunkPutInfo&, std::string& e, bool) { e = "the chunked disk format is POSIX only"; return false; }
+bool ChunkPool::put_buffer(ChunkKind, ChunkBuffer&, size_t, uint8_t, ChunkRef&, ChunkPutInfo&, std::string& e, bool,
+                           const std::vector<CodecSegment>*, ChunkLease*) { e = "the chunked disk format is POSIX only"; return false; }
 bool ChunkPool::get(ChunkKind, const ChunkRef&, void*, size_t, std::string& e, SessionError*) { e = "the chunked disk format is POSIX only"; return false; }
 bool ChunkPool::put(ChunkKind, const void*, size_t, uint8_t, ChunkRef&, ChunkPutInfo&, std::string& e, bool) { e = "the chunked disk format is POSIX only"; return false; }
 bool ChunkPool::exists(const ChunkRef&) const { return false; }
 void ChunkPool::ref(const ChunkRef*, size_t) {}
 void ChunkPool::unref(const ChunkRef*, size_t) {}
-size_t ChunkPool::sweep(bool, bool, const std::set<ChunkKey>*, size_t*) { return 0; }
+size_t ChunkPool::evict_ghosts(uint64_t, const std::function<bool(std::set<ChunkKey>&)>&, uint64_t*, bool*) { return 0; }
+void ChunkPool::census() {}
+std::unique_ptr<ChunkLease> ChunkPool::begin_lease() { return nullptr; }
+struct ChunkLease::Impl {};
+ChunkLease::~ChunkLease() = default;
+void ChunkLease::announce(const ChunkKey&) {}
+void ChunkLease::announce(const ChunkRef*, size_t) {}
+void ChunkLease::release() {}
 bool ChunkPool::sync_touched_shards(std::string&) { return true; }
 void ChunkPool::remove_all() {}
 #else
@@ -509,8 +587,10 @@ bool ChunkPool::open(std::string& error) {
     ::chmod(p.o.dir.c_str(), 0700);
     std::lock_guard<std::mutex> g(p.mu);
     p.idx.clear();
-    p.bytes = 0;
-    const int64_t now = p.now();
+    p.ghost_lru.clear();
+    p.bytes = p.ghost_bytes = 0;
+    const int64_t now = (int64_t) std::time(nullptr);
+    std::vector<std::pair<uint64_t, ChunkKey>> found;   // (mtime ns, key): the ghosts' order, oldest first
     for (const auto& shard : fs::directory_iterator(p.o.dir, ec)) {
         std::error_code e2;
         const std::string sname = shard.path().filename().string();
@@ -519,7 +599,7 @@ bool ChunkPool::open(std::string& error) {
             const std::string name = f.path().filename().string();
             struct stat st {};
             if (::lstat(f.path().c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
-            if (name.rfind(".tmp-", 0) == 0) {
+            if (name.rfind(".tmp-", 0) == 0 || name.rfind(".del-", 0) == 0) {   // (.del-: a victim an evicting engine died over)
                 if (now - (int64_t) st.st_mtime > kTmpMaxAgeS) ::unlink(f.path().c_str());
                 continue;
             }
@@ -530,18 +610,21 @@ bool ChunkPool::open(std::string& error) {
             if (size < kChunkAlign || size > kMaxChunkFile || size % kChunkAlign) continue;
             Impl::Info info;
             info.file_bytes = size;
-            info.stamp = (int64_t) st.st_mtime;
             p.idx[k] = info;
             p.bytes += size;
+            found.emplace_back(mtime_ns(st), k);
         }
     }
+    // every chunk is a ghost until a manifest refs it, ordered by the persisted mtime (ns): the order before the restart
+    std::sort(found.begin(), found.end());
+    for (const auto& f : found) p.ghost_add(f.second, p.idx[f.second], f.first);
     p.opened = true;
     return true;
 }
 
 bool ChunkPool::put_buffer(ChunkKind kind, ChunkBuffer& buf, size_t raw_len, uint8_t shuffle_width, ChunkRef& out,
                            ChunkPutInfo& info, std::string& error, bool durable,
-                           const std::vector<CodecSegment>* segments) {
+                           const std::vector<CodecSegment>* segments, ChunkLease* lease) {
     auto& p = *p_;
     info = {};
     error.clear();
@@ -554,6 +637,9 @@ bool ChunkPool::put_buffer(ChunkKind kind, ChunkBuffer& buf, size_t raw_len, uin
     out = {};
     out.key = key;
     out.raw_len = (uint32_t) raw_len;
+    // shared: the key is announced before the chunk is looked at or written, so a deleter that already snapshotted the
+    // manifests still finds it in the leases when it checks again (ChunkLease)
+    if (lease) lease->announce(key);
 
     // an existing chunk: pinned in the index first (a sweep cannot take it now), then checked on the disk
     using Verdict = Impl::Verdict;
@@ -563,7 +649,7 @@ bool ChunkPool::put_buffer(ChunkKind kind, ChunkBuffer& buf, size_t raw_len, uin
         {
             std::lock_guard<std::mutex> g(p.mu);
             auto it = p.idx.find(key);
-            if (it != p.idx.end()) { ++it->second.refs; pinned = true; }
+            if (it != p.idx.end()) { p.ref_inc(key, it->second); pinned = true; }
         }
         uint32_t stored = 0;
         uint64_t file_bytes = 0;
@@ -574,28 +660,28 @@ bool ChunkPool::put_buffer(ChunkKind kind, ChunkBuffer& buf, size_t raw_len, uin
         auto it = p.idx.find(key);
         if (verdict != Verdict::ok) {
             if (pinned && it != p.idx.end()) {
-                --it->second.refs;
-                if (it->second.refs == 0) { p.bytes -= std::min(p.bytes, it->second.file_bytes); p.idx.erase(it); }
+                // the chunk is not what the index thought (gone or invalid): the unpin forgets it when nothing else
+                // references it (it was pinned, so it is not in the LRU set)
+                if (--it->second.refs == 0) p.drop(it);
             }
             if (verdict == Verdict::error) info.error_kind = why_kind;
             return verdict;
         }
-        const int64_t now = p.now();
-        bool touch = false;
+        // a hit is a use: the chunk is the newest in the LRU order, in memory and on the disk (every hit: the mtime is
+        // the order a restart and the other engines see)
         if (it == p.idx.end()) {
             Impl::Info n;
-            n.file_bytes = file_bytes; n.refs = 1; n.stored_len = stored; n.stored_known = true; n.stamp = now;
+            n.file_bytes = file_bytes; n.refs = 1; n.stored_len = stored; n.stored_known = true; n.seq = p.tick();
             p.idx[key] = n;
             p.bytes += file_bytes;
-            touch = true;
         } else {
             auto& e = it->second;
-            if (!pinned) ++e.refs;
+            if (!pinned) p.ref_inc(key, e);
             if (e.file_bytes != file_bytes) { p.bytes = p.bytes - std::min(p.bytes, e.file_bytes) + file_bytes; e.file_bytes = file_bytes; }
             e.stored_len = stored; e.stored_known = true;
-            if (now - e.stamp >= p.o.grace_s / 4) { e.stamp = now; touch = true; }
+            e.seq = p.tick();
         }
-        if (touch) p.stamp_file(p.path_of(key));
+        p.stamp_file(p.path_of(key));
         out.stored_len = stored;
         info.hit = true;
         info.stored_len = stored;
@@ -678,13 +764,13 @@ bool ChunkPool::put_buffer(ChunkKind kind, ChunkBuffer& buf, size_t raw_len, uin
         std::lock_guard<std::mutex> g(p.mu);
         auto it = p.idx.find(key);
         if (it == p.idx.end()) {
-            p.idx[key] = {file_size, 1, stored_len, true, p.now()};
+            p.idx[key] = {file_size, 1, stored_len, true, p.tick()};
             p.bytes += file_size;
         } else {
             auto& e = it->second;
-            ++e.refs;
+            p.ref_inc(key, e);
             p.bytes = p.bytes - std::min(p.bytes, e.file_bytes) + file_size;
-            e.file_bytes = file_size; e.stored_len = stored_len; e.stored_known = true; e.stamp = p.now();
+            e.file_bytes = file_size; e.stored_len = stored_len; e.stored_known = true; e.seq = p.tick();
         }
     }
     out.stored_len = stored_len;
@@ -746,10 +832,24 @@ bool ChunkPool::get(ChunkKind kind, const ChunkRef& ref, void* dst, size_t dst_c
     if (!(h.key == ref.key)) return corrupt("key mismatch");
     if (h.raw_len != ref.raw_len || h.stored_len != ref.stored_len)
         return fail(SessionError::invalid, "lengths do not match the manifest");
+    // a successful read is a use: the chunk becomes the newest in the LRU order (memory and file mtime)
+    auto used = [&]() {
+        {
+            std::lock_guard<std::mutex> g(p_->mu);
+            auto it = p_->idx.find(ref.key);
+            if (it != p_->idx.end()) {
+                auto& e = it->second;
+                if (e.refs == 0) { p_->ghost_del(ref.key, e); p_->ghost_add(ref.key, e, p_->tick()); }
+                else e.seq = p_->tick();
+            }
+        }
+        p_->stamp_file(p_->path_of(ref.key));
+    };
     const uint8_t* payload = file.get() + kChunkAlign;
     if (h.codec == ChunkCodec::raw) {
         if (!(chunk_key(payload, h.raw_len) == ref.key)) return corrupt("content hash mismatch");
         if (h.raw_len) std::memcpy(dst, payload, h.raw_len);
+        used();
         return true;
     }
     if (!codec_available(h.codec)) return fail(SessionError::invalid, "codec not available in this build");
@@ -760,6 +860,7 @@ bool ChunkPool::get(ChunkKind kind, const ChunkRef& ref, void* dst, size_t dst_c
         return corrupt("decode failed");
     }
     if (!(chunk_key(dst, h.raw_len) == ref.key)) return corrupt("content hash mismatch");
+    used();
     return true;
 }
 
@@ -775,20 +876,18 @@ void ChunkPool::ref(const ChunkRef* refs, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         auto it = p.idx.find(refs[i].key);
         if (it == p.idx.end()) {
-            // seen on the disk by a manifest scan after open() (another engine wrote it): index it
+            // seen on the disk by a manifest scan after open() (another engine wrote it): index it (a manifest names it
+            // now, so it is referenced from the start and never a ghost)
             Impl::Info info;
             struct stat st {};
-            info.stamp = p.now();
-            if (::lstat(p.path_of(refs[i].key).c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-                info.file_bytes = (uint64_t) st.st_size;
-                // the file's own age, as open() indexes it: a chunk another engine made long ago must be touched by the
-                // first hit on it, or that engine's sweep still sees it as old while our manifest is being published
-                info.stamp = (int64_t) st.st_mtime;
-            }
+            info.seq = p.tick();
+            if (::lstat(p.path_of(refs[i].key).c_str(), &st) == 0 && S_ISREG(st.st_mode)) info.file_bytes = (uint64_t) st.st_size;
             it = p.idx.emplace(refs[i].key, info).first;
             p.bytes += info.file_bytes;
+            ++it->second.refs;
+            continue;
         }
-        ++it->second.refs;
+        p.ref_inc(refs[i].key, it->second);
     }
 }
 
@@ -798,41 +897,182 @@ void ChunkPool::unref(const ChunkRef* refs, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         auto it = p.idx.find(refs[i].key);
         if (it == p.idx.end() || it->second.refs == 0) continue;
-        if (--it->second.refs == 0) {
-            // a ghost: its grace starts now (a chunk written long ago must still outlive a take + continue)
-            it->second.stamp = p.now();
-            p.stamp_file(p.path_of(refs[i].key));
-        }
+        p.ref_dec(refs[i].key, it->second);
+        // a ghost: the newest one now (the order a restart and the other engines read back is the file's mtime)
+        if (it->second.refs == 0) p.stamp_file(p.path_of(refs[i].key));
     }
 }
 
-size_t ChunkPool::sweep(bool shared, bool pressure, const std::set<ChunkKey>* foreign, size_t* freed) {
+struct ChunkLease::Impl {
+    std::mutex mu;
+    int fd = -1;
+    std::string path;
+    std::set<ChunkKey> seen;
+};
+ChunkLease::~ChunkLease() { release(); }
+void ChunkLease::release() {
+    if (!p_) return;
+    std::lock_guard<std::mutex> g(p_->mu);
+    if (p_->fd >= 0) {
+        ::unlink(p_->path.c_str());   // first the name, then the lock
+        ::close(p_->fd);
+        p_->fd = -1;
+    }
+}
+void ChunkLease::announce(const ChunkKey& k) {
+    if (!p_) return;
+    std::lock_guard<std::mutex> g(p_->mu);
+    if (p_->fd < 0 || !p_->seen.insert(k).second) return;
+    (void) ::write(p_->fd, k.b.data(), 16);   // O_APPEND; a failure only weakens the protection (the other checks remain)
+}
+void ChunkLease::announce(const ChunkRef* refs, size_t n) {
+    for (size_t i = 0; i < n; ++i) announce(refs[i].key);
+}
+
+std::unique_ptr<ChunkLease> ChunkPool::begin_lease() {
+    if (!p_->o.shared) return nullptr;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const std::string tmp = p_->o.dir + "/.lease-tmp-" + hex64(random64());
+        const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_APPEND, 0600);
+        if (fd < 0) { if (errno == EEXIST) continue; break; }
+        if (::flock(fd, LOCK_EX) != 0) { ::close(fd); ::unlink(tmp.c_str()); break; }
+        const std::string fin = p_->o.dir + "/.lease-" + hex64(random64());
+        if (::rename(tmp.c_str(), fin.c_str()) != 0) { ::close(fd); ::unlink(tmp.c_str()); break; }
+        std::unique_ptr<ChunkLease> l(new ChunkLease());
+        l->p_.reset(new ChunkLease::Impl());
+        l->p_->fd = fd;
+        l->p_->path = fin;
+        return l;
+    }
+    return nullptr;   // no lease: the caller goes on (a failure here only weakens the protection against a deleter race)
+}
+
+size_t ChunkPool::evict_ghosts(uint64_t want_bytes, const std::function<bool(std::set<ChunkKey>&)>& named,
+                               uint64_t* freed_out, bool* undecided) {
     auto& p = *p_;
-    std::lock_guard<std::mutex> g(p.mu);
-    const int64_t now = p.now();
-    size_t removed = 0, bytes = 0;
-    for (auto it = p.idx.begin(); it != p.idx.end();) {
-        auto& e = it->second;
-        bool take = false;
-        if (e.refs == 0) {
-            if (!shared) take = pressure || now - e.stamp > p.o.grace_s;
-            else if (foreign && !foreign->count(it->first)) {
-                // other engines' references are invisible: only an old, unnamed chunk, re-checked on the disk
-                struct stat st {};
-                if (::lstat(p.path_of(it->first).c_str(), &st) != 0) take = true;   // already gone
-                else take = S_ISREG(st.st_mode) && (uint64_t) st.st_size == e.file_bytes &&
-                            now - (int64_t) st.st_mtime > p.o.grace_s;
+    if (freed_out) *freed_out = 0;
+    if (undecided) *undecided = false;
+    if (want_bytes == 0) return 0;
+    if (!p.o.shared) {
+        std::lock_guard<std::mutex> g(p.mu);
+        size_t removed = 0;
+        uint64_t freed = 0;
+        std::vector<std::pair<ChunkKey, uint64_t>> stuck;   // a file that cannot be unlinked stays a ghost, in its place
+        while (freed < want_bytes && !p.ghost_lru.empty()) {
+            const ChunkKey key = p.ghost_lru.begin()->second;
+            auto it = p.idx.find(key);
+            if (it == p.idx.end() || it->second.refs > 0) { p.ghost_lru.erase(p.ghost_lru.begin()); continue; }   // (cannot happen)
+            if (::unlink(p.path_of(key).c_str()) != 0 && errno != ENOENT) {
+                stuck.emplace_back(key, it->second.seq);
+                p.ghost_del(key, it->second);
+                continue;
+            }
+            freed += it->second.file_bytes;
+            ++removed;
+            p.drop(it);
+        }
+        for (const auto& st : stuck) {
+            auto it = p.idx.find(st.first);
+            if (it != p.idx.end()) p.ghost_add(st.first, it->second, st.second);
+        }
+        if (freed_out) *freed_out = freed;
+        return removed;
+    }
+    // ---- shared.  Rounds: each takes the oldest ghosts not looked at yet, until enough is freed or none is left.
+    size_t removed = 0;
+    uint64_t freed = 0;
+    std::set<ChunkKey> examined;
+    for (int round = 0; round < 64 && freed < want_bytes; ++round) {
+        struct Victim { ChunkKey key; uint64_t bytes; std::string aside; bool moved = false; };
+        std::vector<Victim> victims;
+        // S1: the leases FIRST, then the manifests (a writer publishes its manifest, then drops its lease: a lease gone
+        // by now means its manifest is visible to the manifest read that follows)
+        // lease, manifests, lease: a take announces (lease) and then removes its index, a write publishes its index and
+        // then drops its lease - whichever order a racing owner works in, one of the three reads sees its chunk.
+        // Read BEFORE the victims are picked, so that the chunks other engines' manifests name (usually the front of the
+        // order in shared mode) are skipped for free instead of using up the rounds
+        std::set<ChunkKey> prot;
+        p.read_leases(prot);
+        if (!named || !named(prot)) { if (undecided) *undecided = true; break; }
+        p.read_leases(prot);
+        {
+            std::lock_guard<std::mutex> g(p.mu);
+            uint64_t sum = 0;
+            for (const auto& gk : p.ghost_lru) {
+                if (sum >= want_bytes - freed) break;
+                if (examined.count(gk.second) || prot.count(gk.second)) continue;
+                auto it = p.idx.find(gk.second);
+                if (it == p.idx.end() || it->second.refs > 0) continue;
+                victims.push_back({gk.second, it->second.file_bytes, {}, false});
+                sum += it->second.file_bytes;
             }
         }
-        if (!take) { ++it; continue; }
-        if (::unlink(p.path_of(it->first).c_str()) != 0 && errno != ENOENT) { ++it; continue; }
-        p.bytes -= std::min(p.bytes, e.file_bytes);
-        bytes += (size_t) e.file_bytes;
-        ++removed;
-        it = p.idx.erase(it);
+        if (victims.empty()) break;
+        for (const auto& v : victims) examined.insert(v.key);
+        // the unprotected victims leave their names (atomic): a writer that looks now finds no file and writes it again
+        for (auto& v : victims) {
+            v.aside = p.shard_dir(v.key) + "/.del-" + hex64(random64());
+            if (::rename(p.path_of(v.key).c_str(), v.aside.c_str()) == 0) v.moved = true;
+        }
+        // S2, once for the batch: a victim a lease or a manifest names now is put back
+        std::set<ChunkKey> again;
+        p.read_leases(again);
+        const bool again_ok = named(again);   // false: cannot tell, put every one back
+        if (!again_ok && undecided) *undecided = true;
+        std::lock_guard<std::mutex> g(p.mu);
+        for (auto& v : victims) {
+            if (!v.moved) continue;
+            auto it = p.idx.find(v.key);
+            if (!again_ok || again.count(v.key) || (it != p.idx.end() && it->second.refs > 0)) {
+                // link() never replaces: a writer that recreated the name wins, and the trashed copy is dropped
+                (void) ::link(v.aside.c_str(), p.path_of(v.key).c_str());
+                ::unlink(v.aside.c_str());
+                continue;
+            }
+            ::unlink(v.aside.c_str());
+            if (it != p.idx.end()) p.drop(it);   // (a local writer that found it missing forgot it already)
+            freed += v.bytes;
+            ++removed;
+        }
     }
-    if (freed) *freed = bytes;
+    if (freed_out) *freed_out = freed;
     return removed;
+}
+
+void ChunkPool::census() {
+    auto& p = *p_;
+    if (!p.o.shared) return;
+    std::set<ChunkKey> present;
+    std::error_code ec;
+    for (const auto& shard : fs::directory_iterator(p.o.dir, ec)) {
+        std::error_code e2;
+        const std::string sname = shard.path().filename().string();
+        if (sname.size() != 2 || !shard.is_directory(e2)) continue;
+        for (const auto& f : fs::directory_iterator(shard.path(), e2)) {
+            const std::string name = f.path().filename().string();
+            ChunkKey k;
+            if (name.size() != 36 || name.compare(32, 4, ".chk") != 0 || !key_from_hex(name.substr(0, 32), k) ||
+                shard_of(k) != sname) continue;
+            present.insert(k);
+        }
+    }
+    if (ec) return;   // the listing failed: nothing is concluded from it
+    std::lock_guard<std::mutex> g(p.mu);
+    for (const auto& k : present) {
+        if (p.idx.count(k)) continue;
+        struct stat st {};
+        if (::lstat(p.path_of(k).c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        const uint64_t size = (uint64_t) st.st_size;
+        if (size < kChunkAlign || size > kMaxChunkFile || size % kChunkAlign) continue;
+        Impl::Info info;
+        info.file_bytes = size;
+        auto it = p.idx.emplace(k, info).first;
+        p.bytes += size;
+        p.ghost_add(k, it->second, mtime_ns(st));   // another engine's chunk: a ghost, in the order of its file's mtime
+    }
+    for (auto it = p.idx.begin(); it != p.idx.end();)
+        if (it->second.refs == 0 && !present.count(it->first)) it = p.drop(it);
+        else ++it;
 }
 
 bool ChunkPool::sync_touched_shards(std::string& error) {
@@ -873,7 +1113,8 @@ void ChunkPool::remove_all() {
     std::error_code ec;
     fs::remove_all(p.o.dir, ec);
     p.idx.clear();
-    p.bytes = 0;
+    p.ghost_lru.clear();
+    p.bytes = p.ghost_bytes = 0;
     p.touched.clear();
 }
 #endif
@@ -885,6 +1126,14 @@ uint64_t ChunkPool::live_bytes() const {
     for (const auto& kv : p_->idx)
         if (kv.second.refs > 0) n += kv.second.file_bytes;
     return n;
+}
+uint64_t ChunkPool::ghost_bytes() const { std::lock_guard<std::mutex> g(p_->mu); return p_->ghost_bytes; }
+size_t ChunkPool::ghost_count() const { std::lock_guard<std::mutex> g(p_->mu); return p_->ghost_lru.size(); }
+std::vector<ChunkKey> ChunkPool::ghosts_oldest_first() const {
+    std::lock_guard<std::mutex> g(p_->mu);
+    std::vector<ChunkKey> v;
+    for (const auto& gk : p_->ghost_lru) v.push_back(gk.second);
+    return v;
 }
 size_t ChunkPool::count() const { std::lock_guard<std::mutex> g(p_->mu); return p_->idx.size(); }
 uint32_t ChunkPool::refs_of(const ChunkKey& k) const {
@@ -1437,7 +1686,7 @@ bool write_impl(ChunkPool& pool, const std::string& path, const SavedConversatio
         const auto t0 = Clock::now();
         std::string why;
         const bool put_ok = pool.put_buffer(j.kind, j.buf, j.raw_len, j.width, ref, info, why, opt.durable,
-                                            j.segs.empty() ? nullptr : &j.segs);
+                                            j.segs.empty() ? nullptr : &j.segs, opt.lease);
         const double took = ms_since(t0);
         if (!put_ok) { note_failure(info.error_kind, "chunked session: " + why); return; }
         std::lock_guard<std::mutex> g(mu);
@@ -2071,7 +2320,8 @@ bool chunked_read(ChunkPool& pool, const std::string& path, const SessionFileIde
 }
 
 bool chunked_manifest_refs(const std::string& path, const SessionFileIdentity& id, std::vector<ChunkRef>& refs,
-                           uint64_t& manifest_bytes, std::string& error) {
+                           uint64_t& manifest_bytes, std::string& error, bool* transient) {
+    if (transient) *transient = false;
 #ifdef _WIN32
     (void) path; (void) id; (void) refs; (void) manifest_bytes;
     error = "the chunked disk format is POSIX only";
@@ -2081,9 +2331,13 @@ bool chunked_manifest_refs(const std::string& path, const SessionFileIdentity& i
     SessionStatus st;
     SessionReadLimits none;
     try {
-        if (!load_manifest(path, id, none, true, 1, ld, error, st)) return false;
+        if (!load_manifest(path, id, none, true, 1, ld, error, st)) {
+            if (transient) *transient = st.error != SessionError::invalid;
+            return false;
+        }
     } catch (const std::bad_alloc&) {
         error = "chunked session: out of memory while reading " + path;
+        if (transient) *transient = true;
         return false;
     }
     refs = all_refs(ld.p);

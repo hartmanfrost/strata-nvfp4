@@ -3,6 +3,7 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <thread>
 #include <ctime>
 #include <sys/stat.h>
+#include <fcntl.h>
 #ifdef _WIN32
 #include <process.h>
 #define getpid _getpid
@@ -168,6 +170,7 @@ bool logged(const char* what) {
     return false;
 }
 void chunked_suite(const fs::path& dir);
+void limit_suite(const fs::path& dir);
 
 void suite(bool chunked) {
     g_chunked = chunked;
@@ -219,7 +222,7 @@ void suite(bool chunked) {
         check(tier.take(live.id, live.tokens, back, e), "take");
         check(same(back, expect), "read back exactly: both stages, the live state and every checkpoint");
         check(tier.size() == 0 && (chunked || tier.bytes() == 0) && tier_files(dir) == 0,
-              "take removes the entry and its files");   // (chunked: the chunks wait out their grace)
+              "take removes the entry and its files");   // (chunked: the chunks stay as ghosts, a cache until the limit needs the room)
         const auto st = tier.stats();
         check(st.queued == 1 && st.written == 1 && st.disk_hits == 1 && st.ram_hits == 0 && st.tokens_back == 600 &&
               (chunked ? st.bytes_read > (34u << 20) : st.bytes_read == st.bytes_written) &&
@@ -270,7 +273,15 @@ void suite(bool chunked) {
         check(tier.best(prompt_of(450), {}, false).tokens == 0 && tier.best(prompt_of(600, 5000), {}, false).tokens == 500,
               "the newer one stays");
         ConversationDiskTier small(opts(dir, 1ull << 20, 1800));
-        check(small.open(e) && !small.put(image(400, 6)) && small.size() == 0, "above the budget: refused");
+        if (!g_chunked) {
+            check(small.open(e) && !small.put(image(400, 6)) && small.size() == 0, "above the budget: refused");
+        } else {   // chunked: the raw size is no verdict; the real bytes (incompressible here) are over the limit alone: kept, with the WARNING
+            { std::lock_guard<std::mutex> g(lines_m); lines.clear(); }
+            check(small.open(e) && small.put(image(400, 6)), "above the budget: chunked put is queued");
+            small.wait_idle();
+            check(small.size() == 1 && small.stats().limit_rejected == 0 && logged("WARNING [disk-limit]") && logged("alone exceeds"),
+                  "above the budget: chunked, kept alone with the WARNING of the real size");
+        }
     }
     check(tier_files(dir) == 0, "the tier removes its files when it ends");
 
@@ -286,14 +297,23 @@ void suite(bool chunked) {
         clock.t += std::chrono::minutes(9);
         check(tier.expire() == 0 && tier.size() == 2, "29 min: both kept");
         clock.t += std::chrono::minutes(2);
-        check(tier.expire() == 1 && tier.size() == 1 && tier.stats().expired == 1, "31 min: the first is removed");
-        check(tier.best(prompt_of(450), {}, false).tokens == 0 && tier.best(prompt_of(450, 7000), {}, false).tokens == 400,
-              "the younger one stays");
-        check(tier_files(dir) == 1, "the expired file is deleted");
-        clock.t += std::chrono::minutes(30);
-        check(tier.put(image(300, 9, 9000)), "put c, 30 min later");
-        tier.wait_idle();
-        check(tier.size() == 1, "a write removes the expired ones first");
+        if (g_chunked) {   // the chunked format has no time limit: only the storage limit removes an entry
+            check(tier.expire() == 0 && tier.size() == 2 && tier.stats().expired == 0, "31 min: chunked: nothing expires (no time limit)");
+            clock.t += std::chrono::minutes(60 * 24);
+            check(tier.expire() == 0 && tier.size() == 2, "a day later: still both");
+            check(tier.put(image(300, 9, 9000)), "put c, a day later");
+            tier.wait_idle();
+            check(tier.size() == 3 && tier.stats().expired == 0, "a write removes nothing: the limit is far");
+        } else {
+            check(tier.expire() == 1 && tier.size() == 1 && tier.stats().expired == 1, "31 min: the first is removed");
+            check(tier.best(prompt_of(450), {}, false).tokens == 0 && tier.best(prompt_of(450, 7000), {}, false).tokens == 400,
+                  "the younger one stays");
+            check(tier_files(dir) == 1, "the expired file is deleted");
+            clock.t += std::chrono::minutes(30);
+            check(tier.put(image(300, 9, 9000)), "put c, 30 min later");
+            tier.wait_idle();
+            check(tier.size() == 1, "a write removes the expired ones first");
+        }
     }
 
     {   // a read the RAM preflight refuses: nothing restored, the files are gone anyway
@@ -572,6 +592,7 @@ void suite(bool chunked) {
         fs::remove(young);
     }
 
+    limit_suite(dir);
     if (chunked) chunked_suite(dir);
     fs::remove_all(dir);
     std::printf("conversation_disk_test: %s format: %d checks\n", chunked ? "chunked (v2)" : "one-file (v1)", checks - before);
@@ -607,15 +628,11 @@ void age(const fs::path& p, int minutes) {
     fs::last_write_time(p, fs::file_time_type::clock::now() - std::chrono::minutes(minutes));
 }
 
-// the steady clock of the tier and the wall clock of its chunk grace move together
+// the steady clock of the tier (the rate limit of its warnings); there is no wall-clock filter any more
 struct Clocks {
     FakeClock steady;
-    int64_t wall = (int64_t) std::time(nullptr);
-    void advance(int minutes) { steady.t += std::chrono::minutes(minutes); wall += minutes * 60; }
-    ConversationDiskOptions with(ConversationDiskOptions o) {
-        o.wall_clock_s = [this] { return wall; };
-        return o;
-    }
+    void advance(int minutes) { steady.t += std::chrono::minutes(minutes); }
+    void advance_s(int seconds) { steady.t += std::chrono::seconds(seconds); }
 };
 
 // the same conversation carried on: a longer live state, the last byte of layer 0's K changed (the second slab)
@@ -887,8 +904,8 @@ void prefix_suite(const fs::path& dir) {
               q2.write_now(img, nullptr, {}, qid2, e, nullptr, false, &qas) && qas == 0 && qid2 != qid &&
               q2.best(prompt_of(1100, 6000), {}, false).tokens == 1000, "cut copy: the QUIT-time write supersedes the cut one with the whole image");
     }
-    {   // take without keep pins the entry's chunks: a pressure sweep another write triggers during the read (the entry is
-        // already gone, so they are ghosts) must not delete them
+    {   // take without keep pins the entry's chunks: the limit's eviction another write triggers during the read (the entry
+        // is already gone, so they are ghosts) must not delete them
         fs::remove_all(dir);
         const SavedConversation a = geo_image(1000, 90, {600, 300});
         const SavedConversation b = geo_image(1000, 91, {600, 300}, 8000);   // the same size: both do not fit
@@ -912,11 +929,11 @@ void prefix_suite(const fs::path& dir) {
         SavedConversation back;
         bool wrote_b = false;
         const bool ok = t.take(aid, 1000, back, e, [&](uint64_t, std::string&) {
-            wrote_b = t.write_now(b, nullptr, {}, bid, e);   // over the budget: the pressure sweep runs now
+            wrote_b = t.write_now(b, nullptr, {}, bid, e);   // over the limit: the eviction runs now
             return true;
         }, false);
         check(wrote_b, "pin: b was written during the read");
-        check(ok && same(back, a), "pin: the read finishes although a pressure sweep ran while it read");
+        check(ok && same(back, a), "pin: the read finishes although an eviction ran while it read");
     }
     {   // best() reports a queued or running write with the keys it was queued with; live-skip then cuts the entry at
         // its checkpoint: a take of the reported length must miss (the image holds fewer tokens), not hand back a short
@@ -948,7 +965,7 @@ void prefix_suite(const fs::path& dir) {
         const auto m2 = t.best(prompt_of(1100), {}, false);
         check(t.take(m2.id, m2.tokens, back, e, {}, true) && is_prefix_of(back, full, 600), "skip race: a take of the real length reads it");
     }
-    {   // shared: the chunks a write hit are looked at again before its manifest appears (another engine's sweep may
+    {   // shared: the chunks a write hit are looked at again before its manifest appears (another engine's eviction may
         // have taken them); a write that finds one gone fails instead of publishing a manifest that names it
         fs::remove_all(dir);
         auto so = chunked_opts(64);
@@ -964,7 +981,7 @@ void prefix_suite(const fs::path& dir) {
         ConversationDiskTier t(so);
         check(t.open(e), "shared publish: open");
         uint64_t id = 0;
-        check(t.write_now(geo_image(300, 72, {100}), nullptr, {}, id, e), "shared publish: a write with no sweep is fine");
+        check(t.write_now(geo_image(300, 72, {100}), nullptr, {}, id, e), "shared publish: a write with no eviction is fine");
         fire = true;
         check(!t.write_now(geo_image(300, 73, {100}, 4000), nullptr, {}, id, e) && e.find("vanished before the manifest") != std::string::npos,
               "shared publish: a chunk gone before the manifest fails the write");
@@ -972,7 +989,7 @@ void prefix_suite(const fs::path& dir) {
         for (const auto& f : fs::directory_iterator(dir)) manifests += f.path().extension() == ".bin";
         check(manifests == 1, "shared publish: no manifest of the failed write is left");
     }
-    {   // a write that runs out of disk frees the ghosts of earlier takes at once (not after the grace): the retry fits
+    {   // a write that runs out of the DISK (not the limit) frees the ghosts of earlier takes at once: the retry fits
         fs::remove_all(dir);
         auto po = chunked_opts(64);
         po.persist = true;
@@ -990,7 +1007,7 @@ void prefix_suite(const fs::path& dir) {
         uint64_t id = 0;
         check(t.open(e), "full disk: reopen");
         check(!t.write_now(geo_image(600, 75, {300}, 9000), nullptr, {}, id, e) && t.stats().chunks_swept > 0,
-              "full disk: the failed write swept the ghosts (grace not waited for)");
+              "full disk: the failed write freed the ghosts"); check(logged("WARNING [disk-full]"), "full disk: and says so");
     }
     {   // persist: the index names what the file holds; a restart takes it in and a prefix read works on it
         fs::remove_all(dir);
@@ -1016,6 +1033,206 @@ void prefix_suite(const fs::path& dir) {
     fs::remove_all(dir);
 }
 
+// ---- the storage limit (both formats): one limit, oldest out first, a WARNING when a valid entry has to go ----
+size_t count_logged(const char* what) {
+    std::lock_guard<std::mutex> g(lines_m);
+    size_t n = 0;
+    for (const auto& l : lines) n += l.find(what) != std::string::npos ? 1 : 0;
+    return n;
+}
+void clear_log() {
+    std::lock_guard<std::mutex> g(lines_m);
+    lines.clear();
+}
+std::string last_logged(const char* what) {
+    std::lock_guard<std::mutex> g(lines_m);
+    for (size_t i = lines.size(); i-- > 0;)
+        if (lines[i].find(what) != std::string::npos) return lines[i];
+    return {};
+}
+void set_mtime(const fs::path& p, int64_t seconds_ago) {
+    struct timespec ts[2] = {{0, UTIME_OMIT}, {(time_t) (std::time(nullptr) - seconds_ago), 0}};
+    ::utimensat(AT_FDCWD, p.c_str(), ts, 0);
+}
+
+void limit_suite(const fs::path& dir) {
+    const uint64_t GiB = 1ull << 30, MiB = 1ull << 20;
+    std::string e;
+    // image(400, ...) is ~17 MiB of K/V; every conversation gets its own state and first token
+    auto img = [](int i) { return image(400, uint8_t(150 + i), 40000 + 1000 * i); };
+    auto prompt = [](int i) { return prompt_of(450, 40000 + 1000 * i); };
+    check(kConversationDiskDefaultMib == 10240, "limit: the default storage limit is 10240 MiB (10 GB), for both formats");
+
+    {   // LRU: the least recently used entry goes first; a keep-take and a write hit make an entry the newest
+        fs::remove_all(dir);
+        clear_log();
+        Clocks c;
+        ConversationDiskTier t(opts(dir, 40 * MiB, 1800), c.steady.fn());
+        uint64_t a = 0, b = 0, cc = 0, d = 0;
+        check(t.open(e) && t.write_now(img(1), nullptr, {}, a, e) && t.write_now(img(2), nullptr, {}, b, e), "lru: A and B fit");
+        check(t.size() == 2 && t.stats().forced_evictions == 0 && !logged("WARNING [disk-limit]"), "lru: no limit hit, no warning");
+        SavedConversation back;
+        const auto ma = t.best(prompt(1), {}, false);
+        check(ma.id == a && t.take(ma.id, ma.tokens, back, e, {}, true) && same(back, img(1)), "lru: A is used (taken with keep)");
+        check(t.write_now(img(3), nullptr, {}, cc, e), "lru: C written: over the limit");
+        check(t.has(a) && !t.has(b) && t.has(cc) && t.size() == 2, "lru: B, the least recently used, went - not A, which is older");
+        const auto st = t.stats();
+        check(st.forced_evictions == 1 && st.evicted == 1 && st.forced_evicted_bytes > 10 * MiB && st.limit_warnings == 1,
+              "lru: the forced eviction is counted");
+        check(logged("WARNING [disk-limit]") && logged("--conversation-disk-mib") && logged("40 MiB") && logged("evicted a parked conversation"),
+              "lru: a greppable WARNING names the limit and the flag to raise");
+        check(t.summary().find("1 forced: raise --conversation-disk-mib") != std::string::npos, "lru: the totals show it");
+        uint64_t again = 0;
+        check(t.write_now(img(1), nullptr, {}, again, e) && again == a, "lru: writing A's keys again is a hit");
+        check(t.write_now(img(4), nullptr, {}, d, e) && t.has(a) && !t.has(cc) && t.has(d),
+              "lru: the write hit made A the newest: C, not A, went");
+    }
+
+    {   // warnings are rate limited (one line a minute, the others counted into the next); the counters always count
+        fs::remove_all(dir);
+        clear_log();
+        Clocks c;
+        ConversationDiskTier t(opts(dir, 25 * MiB, 1800), c.steady.fn());
+        check(t.open(e), "rate: open");
+        uint64_t id = 0;
+        for (int i = 1; i <= 5; ++i) check(t.write_now(img(i), nullptr, {}, id, e), "rate: written");
+        check(t.stats().forced_evictions == 4 && t.stats().limit_warnings == 1 && count_logged("WARNING [disk-limit]") == 1,
+              "rate: a burst of four forced evictions is one line");
+        c.advance_s(30);
+        check(t.write_now(img(6), nullptr, {}, id, e) && count_logged("WARNING [disk-limit]") == 1 && t.stats().forced_evictions == 5,
+              "rate: still one line half a minute later");
+        c.advance_s(31);
+        check(t.write_now(img(7), nullptr, {}, id, e) && count_logged("WARNING [disk-limit]") == 2 && t.stats().forced_evictions == 6 &&
+              t.stats().limit_warnings == 2 && last_logged("WARNING [disk-limit]").find("4 more since the last warning") != std::string::npos,
+              "rate: a minute later the next line says how many came in between");
+    }
+
+    {   // an image larger than the whole limit is refused with the WARNING; an entry that is over it alone is kept, with the WARNING
+        fs::remove_all(dir);
+        clear_log();
+        ConversationDiskTier t(opts(dir, 10 * MiB, 1800));
+        uint64_t id = 0;
+        if (!g_chunked) {   // v1: the file's size is exact, so the refusal is up front.  Chunked: the real bytes decide (below)
+            check(t.open(e) && !t.write_now(img(1), nullptr, {}, id, e) && e.find("--conversation-disk-mib") != std::string::npos &&
+                  t.stats().limit_rejected == 1 && logged("WARNING [disk-limit]") && logged("rejected a conversation"),
+                  "single: write_now refuses an image over the limit and says so");
+            check(!t.put(img(1)) && t.stats().limit_rejected == 2 && t.size() == 0, "single: put refuses it too");
+        } else {
+            check(t.open(e) && t.write_now(img(1), nullptr, {}, id, e) && t.stats().limit_rejected == 0 && !logged("rejected a conversation"),
+                  "single: chunked write_now is not refused by the raw size (the real bytes are judged after the write)");
+        }
+        // entries that cannot be evicted (the one being read, the one just written) and are over the limit together:
+        // kept, with the WARNING
+        fs::remove_all(dir);
+        clear_log();
+        ConversationDiskTier u(opts(dir, 25 * MiB, 1800));
+        uint64_t a = 0, b = 0;
+        check(u.open(e) && u.write_now(img(1), nullptr, {}, a, e), "single: A written");
+        SavedConversation back;
+        const auto ma = u.best(prompt(1), {}, false);
+        bool wrote = false;
+        check(u.take(ma.id, ma.tokens, back, e, [&](uint64_t, std::string&) {
+            wrote = u.write_now(img(2), nullptr, {}, b, e);   // A is being read: protected; B was just written: protected
+            return true;
+        }, true) && wrote && same(back, img(1)), "single: B is written while A is read");
+        check(u.size() == 2 && u.has(a) && u.has(b) && u.stats().forced_evictions == 0, "single: both are kept, nothing was evicted");
+        check(logged("WARNING [disk-limit]") && logged("alone exceeds"), "single: with a warning that the limit is too small");
+    }
+
+    if (g_chunked) {   // unreferenced chunks go first, oldest first, with no warning: they are only a cache
+        fs::remove_all(dir);
+        clear_log();
+        Clocks c;
+        ConversationDiskTier t(opts(dir, 40 * MiB, 1800), c.steady.fn());
+        uint64_t a = 0, b = 0, cc = 0;
+        check(t.open(e) && t.write_now(img(1), nullptr, {}, a, e) && t.write_now(img(2), nullptr, {}, b, e), "ghosts: A and B written");
+        SavedConversation back;
+        const auto ma = t.best(prompt(1), {}, false), mb = t.best(prompt(2), {}, false);
+        check(t.take(ma.id, ma.tokens, back, e) && t.take(mb.id, mb.tokens, back, e) && t.size() == 0, "ghosts: A taken, then B (their chunks are ghosts)");
+        const size_t n_ghosts = chunk_files(dir);
+        c.advance(60 * 24);
+        check(t.expire() == 0 && chunk_files(dir) == n_ghosts, "ghosts: they stay, however old");
+        check(t.write_now(img(3), nullptr, {}, cc, e), "ghosts: C written: ghosts and C are over the limit");
+        check(t.stats().forced_evictions == 0 && !logged("WARNING [disk-limit]") && t.stats().chunks_swept > 0 && t.bytes() <= 40 * MiB,
+              "ghosts: A's ghosts went to make room, no entry did, no warning");
+        const auto before = t.stats();
+        uint64_t b2 = 0, a2 = 0;
+        check(t.write_now(img(2), nullptr, {}, b2, e) && t.stats().chunks_new == before.chunks_new && t.stats().chunks_hit > before.chunks_hit,
+              "ghosts: B's chunks (the newer ghosts) survived: a rewrite of B is all hits");
+        const auto mid = t.stats();
+        check(t.write_now(img(1), nullptr, {}, a2, e) && t.stats().chunks_new > mid.chunks_new, "ghosts: A's (the oldest) were evicted: A is written again");
+    }
+
+    {   // restart (persist): the LRU order is rebuilt from the index files' mtimes; a keep-take touched one
+        fs::remove_all(dir);
+        clear_log();
+        auto po = [&](uint64_t budget) {
+            auto o = opts(dir, budget, 0);
+            o.persist = true;
+            o.identity = {5, 7};
+            return o;
+        };
+        {
+            ConversationDiskTier t(po(GiB));
+            uint64_t id = 0;
+            check(t.open(e) && t.write_now(img(1), nullptr, {}, id, e) && t.write_now(img(2), nullptr, {}, id, e) &&
+                  t.write_now(img(3), nullptr, {}, id, e), "restart: A, B, C written");
+        }
+        auto idx_of = [&](int n) {
+            for (const auto& f : fs::directory_iterator(dir))
+                if (f.path().extension() == ".idx" && f.path().filename().string().find("-" + std::to_string(n) + ".idx") != std::string::npos)
+                    return f.path();
+            return fs::path();
+        };
+        check(!idx_of(1).empty() && !idx_of(2).empty() && !idx_of(3).empty(), "restart: three index files");
+        set_mtime(idx_of(1), 1000);   // A oldest, then B, then C
+        set_mtime(idx_of(2), 900);
+        set_mtime(idx_of(3), 800);
+        {   // a run uses A (keep): its index is touched: now the order is B, C, A
+            ConversationDiskTier t(po(GiB));
+            check(t.open(e) && t.size() == 3, "restart: taken in");
+            SavedConversation back;
+            const auto ma = t.best(prompt(1), {}, false);
+            check(ma.tokens > 0 && t.take(ma.id, ma.tokens, back, e, {}, true), "restart: A taken with keep");
+        }
+        ConversationDiskTier t(po(25 * MiB));   // a smaller limit at the next start: one image fits
+        check(t.open(e) && t.size() == 1 && t.best(prompt(1), {}, false).tokens > 0 && t.best(prompt(2), {}, false).tokens == 0 &&
+              t.best(prompt(3), {}, false).tokens == 0, "restart: the order was rebuilt from the mtimes: B and C went, A (used last) stayed");
+        check(t.stats().forced_evictions == 2 && logged("WARNING [disk-limit]") && logged("2 over the limit removed"),
+              "restart: removing them at the start is forced eviction too: warning, counter");
+        check(t.bytes() <= 25 * MiB, "restart: and the total fits");
+    }
+
+    {   // threads: concurrent writers, a taker and forced evictions (the TSAN pass runs this too)
+        fs::remove_all(dir);
+        clear_log();
+        ConversationDiskTier t(opts(dir, 40 * MiB, 1800));
+        check(t.open(e), "threads: open");
+        std::vector<std::thread> ths;
+        std::atomic<int> okw{0};
+        for (int i = 1; i <= 3; ++i)
+            ths.emplace_back([&, i] {
+                uint64_t id = 0;
+                std::string er;
+                for (int k = 0; k < 2; ++k) okw += t.write_now(img(i * 2 + k), nullptr, {}, id, er) ? 1 : 0;
+            });
+        ths.emplace_back([&] {
+            for (int k = 0; k < 40; ++k) {
+                for (int i = 2; i <= 7; ++i) {
+                    const auto m = t.best(prompt(i), {}, false);
+                    SavedConversation back;
+                    std::string er;
+                    if (m.id) t.take(m.id, m.tokens, back, er, {}, true);
+                }
+                (void) t.summary();
+            }
+        });
+        for (auto& th : ths) th.join();
+        check(okw == 6 && t.size() <= 2 && t.bytes() <= 40 * MiB && t.stats().forced_evictions >= 4, "threads: all written, the limit held");
+    }
+    fs::remove_all(dir);
+}
+
 void chunked_suite(const fs::path& dir) {
     const uint64_t GiB = 1ull << 30;
     std::string e;
@@ -1023,7 +1240,7 @@ void chunked_suite(const fs::path& dir) {
 
     {   // 5. dedup: an image that differs only in its tokens writes no chunk; one changed slab writes one
         Clocks c;
-        ConversationDiskTier tier(c.with(opts(dir, GiB, 1800)), c.steady.fn());
+        ConversationDiskTier tier(opts(dir, GiB, 1800), c.steady.fn());
         check(tier.open(e) && pool_dirs(dir) == 1, "dedup: open makes the pool");
         uint64_t a = 0, b = 0, d = 0;
         check(tier.write_now(image(800, 70), nullptr, {}, a, e), "dedup: A written");
@@ -1048,9 +1265,10 @@ void chunked_suite(const fs::path& dir) {
     }
     check(!fs::exists(dir) || pool_dirs(dir) == 0, "dedup: a non-persistent tier removes its pool at the end");
 
-    {   // 6. take then continue: the chunks of a taken entry survive the grace and give hits; then they are swept
+    {   // 6. take then continue: the chunks of a taken entry stay (there is no time filter) and give hits
+        clear_log();
         Clocks c;
-        ConversationDiskTier tier(c.with(opts(dir, GiB, 1800)), c.steady.fn());
+        ConversationDiskTier tier(opts(dir, GiB, 1800), c.steady.fn());
         check(tier.open(e), "flaw: open");
         uint64_t a = 0, d = 0;
         check(tier.write_now(image(800, 71), nullptr, {}, a, e), "flaw: A written");
@@ -1060,42 +1278,42 @@ void chunked_suite(const fs::path& dir) {
         check(m.id == a && tier.take(m.id, m.tokens, back, e) && same(back, image(800, 71)), "flaw: A taken");
         check(tier.size() == 0 && tier_files(dir) == 0 && chunk_files(dir) == n0 && tier.bytes() > (17u << 20),
               "flaw: the manifest is gone, the chunks are still there (ghosts)");
-        c.advance(5);
-        check(tier.expire() == 0 && chunk_files(dir) == n0, "flaw: 5 min: still there");
+        c.advance(60 * 24);   // a day later
+        check(tier.expire() == 0 && chunk_files(dir) == n0, "flaw: a day later: still there (no time filter)");
         const auto before = tier.stats();
         check(tier.write_now(continued(1000, 71), nullptr, {}, d, e), "flaw: the continuation is written");
         const auto after = tier.stats();
         check(after.chunks_new == before.chunks_new + 1 && after.chunks_hit > before.chunks_hit &&
               after.new_file_bytes - before.new_file_bytes < (12u << 20), "flaw: it hit the taken entry's chunks");
         check(chunk_files(dir) == n0 + 1, "flaw: one new chunk beside the old ones");
-        c.advance(7);   // 12 min after the take: the ghost nobody took back goes, the continuation's chunks stay
+        c.advance(60 * 24);
         tier.expire();
-        check(chunk_files(dir) == n0 && tier.pool_chunks() == n0 && logged("swept 1 unreferenced chunk"),
-              "flaw: after the grace the unreferenced slab is swept, the referenced chunks stay");
+        check(chunk_files(dir) == n0 + 1 && tier.pool_chunks() == n0 + 1 && after.chunks_swept == 0,
+              "flaw: the unreferenced slab is kept as well, however old: nothing needs its room");
         const auto m2 = tier.best(prompt_of(1100), {}, false);
         check(m2.id == d && tier.take(m2.id, m2.tokens, back, e) && same(back, continued(1000, 71)),
               "flaw: the continuation still reads back exactly");
-        c.advance(11);
-        tier.expire();
-        check(chunk_files(dir) == 0 && tier.bytes() == 0, "flaw: nothing referenced, nothing left after the grace");
+        check(chunk_files(dir) == n0 + 1 && tier.bytes() > (17u << 20),
+              "flaw: nothing referenced any more, everything stays as a dedup cache");
+        check(tier.stats().forced_evictions == 0 && !logged("WARNING [disk-limit]"), "flaw: and no warning: no limit was hit");
     }
 
-    {   // 7. budget: an entry that shares everything frees about nothing and the loop goes on; TTL frees the last owner's
+    {   // 7. limit: an entry that shares everything frees about nothing and the loop goes on; the last owner frees it
         Clocks c;
-        ConversationDiskTier tier(c.with(opts(dir, 20ull << 20, 30 * 60)), c.steady.fn());
-        check(tier.open(e), "budget: open");
+        ConversationDiskTier tier(opts(dir, 20ull << 20, 30 * 60), c.steady.fn());
+        check(tier.open(e), "limit: open");
         uint64_t x = 0, y = 0, z = 0;
         check(tier.write_now(image(400, 80), nullptr, {}, x, e) && tier.write_now(image(500, 80, 9000), nullptr, {}, y, e),
-              "budget: two conversations with the same state");
-        check(tier.size() == 2 && tier.stats().evicted == 0, "budget: dedup fits both in 20 MiB");
-        check(tier.write_now(image(400, 81, 12000), nullptr, {}, z, e), "budget: a third with its own state");
-        check(tier.size() == 1 && tier.has(z) && tier.stats().evicted == 2, "budget: both sharers go, the last owner frees it");
-        check(tier.bytes() < (20u << 20) + (1u << 20), "budget: the pool fits again");
+              "limit: two conversations with the same state");
+        check(tier.size() == 2 && tier.stats().evicted == 0, "limit: dedup fits both in 20 MiB");
+        check(tier.write_now(image(400, 81, 12000), nullptr, {}, z, e), "limit: a third with its own state");
+        check(tier.size() == 1 && tier.has(z) && tier.stats().evicted == 2 && tier.stats().forced_evictions == 2,
+              "limit: both sharers go, the last owner frees it");
+        check(tier.bytes() < (20u << 20) + (1u << 20), "limit: the pool fits again");
         c.advance(31);
-        check(tier.expire() == 1 && tier.size() == 0 && chunk_files(dir) > 0, "ttl: the entry expires, its chunks wait");
-        c.advance(11);
-        tier.expire();
-        check(chunk_files(dir) == 0, "ttl: and are swept after the grace");
+        check(tier.expire() == 0 && tier.size() == 1 && chunk_files(dir) > 0, "ttl: the chunked format ignores the time limit");
+        c.advance(60 * 24);
+        check(tier.expire() == 0 && tier.size() == 1, "ttl: whatever the age");
     }
 
     {   // 8. GC: leftovers of a crash, foreign pools, hits refresh the mtime
@@ -1125,7 +1343,6 @@ void chunked_suite(const fs::path& dir) {
         }
         check(ys.size() == 2, "gc: Y's index and manifest found");
         for (const auto& f : ys) fs::remove(f);
-        for (const auto& f : chunk_paths(dir)) age(f, 30);
         const fs::path pool = [&] {
             for (const auto& d : fs::directory_iterator(dir))
                 if (d.is_directory()) return d.path();
@@ -1138,7 +1355,7 @@ void chunked_suite(const fs::path& dir) {
         {
             ConversationDiskTier t(persistent(1));
             check(t.open(e) && t.size() == 1, "gc: reopened, X taken in");
-            check(chunk_files(dir) == n_x, "gc: Y's orphan chunks are swept at the start, X's stay");
+            check(chunk_files(dir) == n_xy, "gc: Y's orphan chunks stay as ghosts at the start (nothing needs their room)");
             check(!fs::exists(pool / "aa" / ".tmp-0000000000000001") && fs::exists(pool / "aa" / ".tmp-0000000000000002"),
                   "gc: an old temporary chunk goes, a young one stays");
             const auto m = t.best(prompt_of(450), {}, false);
@@ -1171,62 +1388,135 @@ void chunked_suite(const fs::path& dir) {
             check(t.open(e) && pool_dirs(dir) == 1 && !fs::exists(dir / "strata-pool-n0000dead0000beef"),
                   "gc: a non-persistent start removes the pools of earlier runs");
         }
-        // a hit refreshes the mtime (at most once per grace/4)
+        // a hit refreshes the mtime, every time (the persisted LRU order)
         Clocks c;
-        ConversationDiskTier t(c.with(opts(dir, GiB, 1800)), c.steady.fn());
+        ConversationDiskTier t(opts(dir, GiB, 1800), c.steady.fn());
         check(t.open(e), "gc: hit: open");
         uint64_t a = 0, b = 0;
         check(t.write_now(image(400, 85), nullptr, {}, a, e), "gc: hit: A");
         const auto cs = chunk_paths(dir);
         const int64_t t0 = mtime_s(cs.front());
-        c.advance(1);
-        check(t.write_now(image(500, 85), nullptr, {}, b, e) && mtime_s(cs.front()) == t0, "gc: hit: a young chunk is left alone");
-        c.advance(5);
-        check(t.write_now(image(600, 85), nullptr, {}, a, e) && mtime_s(cs.front()) >= c.wall - 1,
-              "gc: hit: an older chunk is touched");
+        for (const auto& f : cs) age(f, 120);
+        check(mtime_s(cs.front()) < t0 - 3600, "gc: hit: the chunks are old now");
+        check(t.write_now(image(500, 85), nullptr, {}, b, e) && mtime_s(cs.front()) >= t0 - 2, "gc: hit: a hit touches the chunk");
+        age(cs.front(), 120);
+        check(t.write_now(image(600, 85), nullptr, {}, a, e) && mtime_s(cs.front()) >= t0 - 2, "gc: hit: and every later hit touches it again");
     }
 
-    {   // 8b. shared: never deleted by refs=0; swept only when no manifest names it and its mtime is old
-        auto sharedo = [&](Clocks& c) {
-            auto o = opts(dir, GiB, 0);
+    {   // 8b. shared: nothing is deleted without need; under the limit, never a chunk a manifest or a lease names
+        auto sharedo = [&](uint64_t budget) {
+            auto o = opts(dir, budget, 0);
             o.persist = true;
             o.shared = true;
             o.identity = {1, 7};
-            return c.with(std::move(o));
+            return o;
         };
         fs::remove_all(dir);
         Clocks c;
-        ConversationDiskTier t1(sharedo(c), c.steady.fn()), t2(sharedo(c), c.steady.fn());
-        check(t1.open(e) && t2.open(e), "shared gc: both open");
-        uint64_t x = 0, y = 0;
-        check(t1.write_now(image(400, 86), nullptr, {}, x, e) && t1.write_now(image(500, 86, 9000), nullptr, {}, y, e),
-              "shared gc: engine 1 writes X and Y (the same state)");
-        const size_t n = chunk_files(dir);
-        check(t2.rescan() == 2 && t2.size() == 2, "shared gc: engine 2 takes both in");
-        auto mx = t2.best(prompt_of(450), {}, false);
-        SavedConversation back;
-        check(mx.tokens == 400 && t2.take(mx.id, mx.tokens, back, e) && same(back, image(400, 86)),
-              "shared gc: engine 2 takes X");
-        check(chunk_files(dir) == n && t2.pool_chunks() == n, "shared gc: nothing deleted by refs=0");
-        c.advance(11);
-        t2.expire();
-        check(chunk_files(dir) == n, "shared gc: Y's manifest still names every chunk: kept although old and unreferenced here");
-        auto my = t2.best(prompt_of(550, 9000), {}, false);
-        check(my.tokens == 500 && t2.take(my.id, my.tokens, back, e) && tier_files(dir) == 0, "shared gc: engine 2 takes Y too");
-        c.advance(2);
-        t2.expire();
-        check(chunk_files(dir) == n, "shared gc: just unreferenced, mtime young: kept");
-        c.advance(11);
-        t2.expire();
-        check(chunk_files(dir) == 0, "shared gc: unnamed and old: swept");
-        check(t1.rescan() == 0 && t1.size() == 0, "shared gc: engine 1 sees both entries gone");
-        t1.expire();
-        check(t1.pool_chunks() == 0, "shared gc: and forgets the chunks that are gone");
+        {
+            ConversationDiskTier t1(sharedo(GiB), c.steady.fn()), t2(sharedo(GiB), c.steady.fn());
+            check(t1.open(e) && t2.open(e), "shared gc: both open");
+            uint64_t x = 0, y = 0;
+            check(t1.write_now(image(400, 86), nullptr, {}, x, e) && t1.write_now(image(500, 86, 9000), nullptr, {}, y, e),
+                  "shared gc: engine 1 writes X and Y (the same state)");
+            const size_t n = chunk_files(dir);
+            check(t2.rescan() == 2 && t2.size() == 2, "shared gc: engine 2 takes both in");
+            auto mx = t2.best(prompt_of(450), {}, false);
+            SavedConversation back;
+            check(mx.tokens == 400 && t2.take(mx.id, mx.tokens, back, e) && same(back, image(400, 86)), "shared gc: engine 2 takes X");
+            auto my = t2.best(prompt_of(550, 9000), {}, false);
+            check(my.tokens == 500 && t2.take(my.id, my.tokens, back, e) && tier_files(dir) == 0, "shared gc: engine 2 takes Y too");
+            c.advance(60 * 24);
+            t2.expire();
+            check(chunk_files(dir) == n && t2.pool_chunks() == n, "shared gc: nothing is deleted without need, however old (no time filter)");
+            check(t1.rescan() == 0 && t1.size() == 0, "shared gc: engine 1 sees both entries gone");
+            check(chunk_files(dir) == n && t1.pool_chunks() == n, "shared gc: the chunks stay for both engines");
+        }
+        // under the limit: W (written by engine 2, unknown to engine 1) is never deleted by engine 1's eviction; X's
+        // ghosts are
+        fs::remove_all(dir);
+        clear_log();
+        {
+            ConversationDiskTier t1(sharedo(40ull << 20), c.steady.fn()), t2(sharedo(GiB), c.steady.fn());
+            check(t1.open(e) && t2.open(e), "shared limit: both open");
+            uint64_t w = 0, x = 0, yy = 0;
+            check(t2.write_now(image(400, 120, 20000), nullptr, {}, w, e), "shared limit: engine 2 writes W");
+            check(t1.write_now(image(400, 121, 21000), nullptr, {}, x, e), "shared limit: engine 1 writes X (W is not known to it)");
+            SavedConversation back;
+            const auto mx = t1.best(prompt_of(450, 21000), {}, false);
+            check(mx.id == x && t1.take(mx.id, mx.tokens, back, e), "shared limit: engine 1 takes X back: its chunks are ghosts");
+            const size_t before = chunk_files(dir);
+            check(t1.write_now(image(400, 122, 22000), nullptr, {}, yy, e), "shared limit: engine 1 writes Y: over the limit with W and X's ghosts");
+            check(t1.bytes() <= (40ull << 20) && t1.stats().chunks_swept > 0 && chunk_files(dir) < before + 5,
+                  "shared limit: just enough of X's ghosts were evicted (oldest first), the rest stay");
+            check(t1.stats().forced_evictions == 0 && !logged("WARNING [disk-limit]"), "shared limit: no entry had to go: no warning");
+            check(t2.take(w, 400, back, e) && same(back, image(400, 120, 20000)), "shared limit: W is intact: its manifest names its chunks");
+        }
+        // a corrupt manifest of another engine under a live index: no chunk may be deleted while it cannot be read, and the
+        // limit must not then evict every entry (each would only make more ghosts that cannot go); after 3 passes the manifest
+        // is given up on (nobody can use that entry) and the limit works again
+        fs::remove_all(dir);
+        clear_log();
+        {
+            ConversationDiskTier t1(sharedo(25ull << 20), c.steady.fn()), t2(sharedo(GiB), c.steady.fn());
+            check(t1.open(e) && t2.open(e), "shared undecided: both open");
+            uint64_t w = 0, x = 0, y = 0, z = 0;
+            check(t2.write_now(image(400, 140, 50000), nullptr, {}, w, e), "shared undecided: engine 2 writes W");
+            for (const auto& f : fs::directory_iterator(dir))
+                if (f.path().extension() == ".bin") fs::resize_file(f.path(), 100);   // torn, the magic stays: W's index still names it
+            check(t1.write_now(image(400, 141, 51000), nullptr, {}, x, e), "shared undecided: engine 1 writes X");
+            check(t1.size() == 1 && t1.stats().forced_evictions == 0 && logged("could not be read"),
+                  "shared undecided: over the limit with W's chunks that cannot be judged: nothing evicted, one warning says why");
+            check(t1.write_now(image(400, 142, 52000), nullptr, {}, y, e), "shared undecided: engine 1 writes Y");
+            check(t1.size() == 2 && t1.stats().forced_evictions == 0, "shared undecided: still nothing evicted (not a cascade)");
+            check(t1.write_now(image(400, 143, 53000), nullptr, {}, z, e) && t1.stats().forced_evictions >= 1 && t1.has(z) && t1.bytes() <= (25ull << 20),
+                  "shared undecided: the third pass gives the unreadable manifest up: the limit works again");
+        }
+        // an index of another engine that cannot be READ (I/O error, not a bad file) is never taken as naming nothing,
+        // however many passes: its chunks are never deleted and no live entry is forced out
+        if (geteuid() != 0) {
+            fs::remove_all(dir);
+            clear_log();
+            ConversationDiskTier t1(sharedo(25ull << 20), c.steady.fn()), t2(sharedo(GiB), c.steady.fn());
+            check(t1.open(e) && t2.open(e), "shared transient: both open");
+            uint64_t w = 0, x = 0, y = 0, z = 0;
+            check(t2.write_now(image(400, 150, 60000), nullptr, {}, w, e), "shared transient: engine 2 writes W");
+            std::vector<fs::path> idx;
+            for (const auto& f : fs::directory_iterator(dir))
+                if (f.path().extension() == ".idx") idx.push_back(f.path());
+            for (const auto& p : idx) fs::permissions(p, fs::perms::none);
+            const bool wr = t1.write_now(image(400, 151, 61000), nullptr, {}, x, e) && t1.write_now(image(400, 152, 62000), nullptr, {}, y, e) &&
+                            t1.write_now(image(400, 153, 63000), nullptr, {}, z, e) && t1.write_now(image(400, 154, 64000), nullptr, {}, z, e);
+            for (const auto& p : idx) fs::permissions(p, fs::perms::owner_read | fs::perms::owner_write);
+            check(wr && t1.stats().forced_evictions == 0, "shared transient: four passes with W's index unreadable: still nothing evicted");
+            SavedConversation back;
+            check(t2.take(w, 400, back, e) && same(back, image(400, 150, 60000)), "shared transient: W's chunks were never deleted");
+        }
+        // a take (no keep) announces the entry's chunks before its index goes: another engine's eviction, running while
+        // the read is in progress, finds them only in the lease and must leave them
+        fs::remove_all(dir);
+        {
+            ConversationDiskTier t1(sharedo(GiB), c.steady.fn()), t2(sharedo(30ull << 20), c.steady.fn());
+            check(t1.open(e) && t2.open(e), "shared take: both open");
+            uint64_t x = 0, z = 0;
+            check(t1.write_now(image(400, 130, 30000), nullptr, {}, x, e), "shared take: engine 1 writes X");
+            const auto mx = t1.best(prompt_of(450, 30000), {}, false);
+            SavedConversation back;
+            bool fired = false;
+            const bool ok = t1.take(mx.id, mx.tokens, back, e, [&](uint64_t, std::string&) {
+                // X's index is gone, its manifest is being read: engine 2 needs room and sees X's chunks as unnamed files
+                fired = t2.write_now(image(400, 131, 31000), nullptr, {}, z, e);
+                return true;
+            }, false);
+            check(fired, "shared take: engine 2 wrote Z during the read");
+            check(ok && same(back, image(400, 130, 30000)), "shared take: the read is intact: the lease kept the chunks");
+        }
     }
 
     {   // 9. failures: a cancel in the middle, no space, a torn chunk, two writers of one chunk
+        fs::remove_all(dir);   // (the shared tests above leave a persistent pool: ghosts stay now)
         Clocks c;
-        ConversationDiskTier tier(c.with(opts(dir, GiB, 1800)), c.steady.fn());
+        ConversationDiskTier tier(opts(dir, GiB, 1800), c.steady.fn());
         check(tier.open(e), "fail: open");
         uint64_t id = 0;
         int asked = 0;
@@ -1237,11 +1527,11 @@ void chunked_suite(const fs::path& dir) {
         const size_t orphans = chunk_files(dir);
         // (with workers, up to that many more chunks were in flight when the cancel came)
         check((g_workers == 1 ? orphans == 2 : orphans <= 2 + (size_t) g_workers) && tier.pool_chunks() == orphans, "fail: the chunks done stay as ghosts");
-        c.advance(11);
+        c.advance(60 * 24);
         tier.expire();
-        check(chunk_files(dir) == 0, "fail: the orphans are swept after the grace");
+        check(chunk_files(dir) == orphans, "fail: the orphans stay as ghosts, however old (they go first when the limit needs the room)");
         const fs::path fdir = dir / "full";   // (a folder belongs to one non-persistent tier)
-        ConversationDiskTier full([&] { auto o = c.with(opts(fdir, GiB, 1800)); o.min_free_bytes = 1ull << 60; return o; }(),
+        ConversationDiskTier full([&] { auto o = opts(fdir, GiB, 1800); o.min_free_bytes = 1ull << 60; return o; }(),
                                   c.steady.fn());
         check(full.open(e) && !full.write_now(image(400, 88), nullptr, {}, id, e) && full.size() == 0 &&
               tier_files(fdir) == 0 && chunk_files(fdir) == 0 && full.stats().write_failed == 1,
@@ -1336,6 +1626,25 @@ void chunked_suite(const fs::path& dir) {
         SavedConversation back;
         auto m = t.best(prompt_of(450), {}, false);
         check(m.tokens == 400 && t.take(m.id, m.tokens, back, e) && same(back, image(400, 97)), "codec: reads back exactly");
+        g_random_fill = saved;
+    }
+
+    if (codec_available(ChunkCodec::zstd)) {   // 11. the limit is judged on the real bytes: a raw size over it that compresses under it is stored, with no warning
+        fs::remove_all(dir);
+        clear_log();
+        const bool saved = g_random_fill;
+        g_random_fill = false;
+        auto o = opts(dir, 10ull << 20, 1800);   // image(400, 97) holds 17 MiB raw
+        o.codec = ChunkCodec::zstd;
+        o.codec_level = 3;
+        ConversationDiskTier t(o);
+        uint64_t id = 0;
+        check(t.open(e) && t.write_now(image(400, 97), nullptr, {}, id, e) && t.has(id), "real size: written although the raw size is over the limit");
+        check(t.stats().limit_rejected == 0 && t.stats().limit_warnings == 0 && !logged("WARNING [disk-limit]") && e.empty(),
+              "real size: no false limit warning");
+        SavedConversation back;
+        auto m = t.best(prompt_of(450), {}, false);
+        check(m.tokens == 400 && t.take(m.id, m.tokens, back, e) && same(back, image(400, 97)), "real size: reads back exactly");
         g_random_fill = saved;
     }
     prefix_suite(dir);

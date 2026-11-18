@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -12,11 +13,16 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <random>
 #include <set>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 #if defined(__linux__)
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -156,6 +162,19 @@ std::vector<ChunkRef> unique_refs(const std::vector<ChunkRef>& refs) {
     for (const auto& r : refs)
         if (seen.insert(r.key).second) out.push_back(r);
     return out;
+}
+
+// the file's mtime in nanoseconds (0 when it cannot be read)
+int64_t file_mtime_ns(const std::string& path) {
+#ifndef _WIN32
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) return 0;
+    return (int64_t) st.st_mtim.tv_sec * 1000000000ll + (int64_t) st.st_mtim.tv_nsec;
+#else
+    std::error_code ec;
+    const auto t = fs::last_write_time(upath(path), ec);
+    return ec ? 0 : (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+#endif
 }
 
 uint64_t sources_bytes(const std::vector<SessionKvSource>* sources) {
@@ -312,9 +331,20 @@ bool ConversationDiskTier::write_index(Entry& e, std::string& error) const {
     return true;
 }
 
-bool ConversationDiskTier::read_index(const std::string& path, Entry& e) const {
+bool ConversationDiskTier::read_index(const std::string& path, Entry& e, bool* transient) const {
+    if (transient) *transient = false;
     std::ifstream f(upath(path), std::ios::binary);
-    const std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string b;
+    try {
+        b.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    } catch (const std::bad_alloc&) {
+        if (transient) *transient = true;
+        return false;
+    }
+    if (transient) {   // an open or read error says nothing about the index (a missing file is a removed entry: not transient)
+        std::error_code xec;
+        if ((!f.is_open() || f.bad()) && fs::exists(upath(path), xec)) *transient = true;
+    }
     if (b.size() < 8) return false;
     uint64_t stored = 0;
     std::memcpy(&stored, b.data() + b.size() - 8, 8);
@@ -357,6 +387,7 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
         Entry e;
         const bool index = it->path().extension() == ".idx";
         const bool taken = index && options_.persist && read_index(ustr(it->path()), e) && bind_chunks(e);
+        if (taken) e.idx_ns = file_mtime_ns(ustr(it->path()));
         if (index && options_.shared) seen_index_.insert(ustr(it->path()));
         if (taken) found.push_back(std::move(e));
         else others.push_back(ustr(it->path()));
@@ -387,20 +418,24 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
         remove_file(p);
         ++stale;
     }
-    std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) { return a.written_s < b.written_s; });
+    // the LRU order a restart rebuilds: the index files' mtimes (a keep-take touches one), then the time it was written
+    std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) {
+        if (a.idx_ns != b.idx_ns) return a.idx_ns < b.idx_ns;
+        if (a.written_s != b.written_s) return a.written_s < b.written_s;
+        return a.index < b.index;
+    });
     for (auto& e : found) {
         e.id = ++next_id_;
         e.at = now_();
         bytes_ += e.bytes;
         entries_.push_back(std::move(e));
     }
+    // (chunks no manifest names - an interrupted write, a removed entry - stay as ghosts, oldest first out)
     size_t over = 0;
     make_room_locked(0, 0, over);
-    // chunks no manifest names (an interrupted write, a removed entry): kept for the grace, then swept
-    if (pool_ && !options_.shared) sweep_locked(true);
     if (!options_.persist) return {};
-    return fmt("persistent (budget only): %zu conversations from earlier runs (%.0f MiB), %zu refused (another model, "
-               "engine version or settings), %zu over the budget removed", entries_.size(),
+    return fmt("persistent (storage limit only, oldest out first): %zu conversations from earlier runs (%.0f MiB), %zu refused "
+               "(another model, engine version or settings), %zu over the limit removed", entries_.size(),
                mib(bytes_ + pool_bytes_all()), refused, over);
 }
 
@@ -435,7 +470,7 @@ bool ConversationDiskTier::open(std::string& error) {
         po.codec = options_.codec;
         po.zstd_level = options_.codec_level;
         po.min_free_bytes = options_.min_free_bytes;
-        po.clock_s = options_.wall_clock_s;
+        po.shared = options_.shared;
         auto pool = std::make_unique<ChunkPool>(std::move(po));
         if (!pool->open(error)) return false;
         pool_ = std::move(pool);
@@ -455,11 +490,14 @@ bool ConversationDiskTier::open(std::string& error) {
     }
     open_ = true;
     thread_ = std::thread([this] { writer(); });
-    const std::string kept = options_.persist ? taken_in : fmt("%lld min per conversation", (long long) (options_.ttl_s / 60));
+    const std::string kept = options_.persist ? taken_in
+        : options_.chunked && pool_ ? std::string("no time limit, oldest out first")
+        : fmt("%lld min per conversation", (long long) (options_.ttl_s / 60));
     std::string codec = "raw";
     if (options_.codec == ChunkCodec::zstd)
         codec = codec_available(ChunkCodec::zstd) ? fmt("zstd:%d", options_.codec_level) : "raw (zstd is not built in)";
-    log(fmt("on: %s, budget %.0f MiB, %s; %zu stale files removed%s", options_.dir.c_str(), mib(options_.budget_bytes),
+    flush_warnings();
+    log(fmt("on: %s, storage limit %.0f MiB, %s; %zu stale files removed%s", options_.dir.c_str(), mib(options_.budget_bytes),
             kept.c_str(), stale,
             options_.chunked && pool_ ? fmt("; chunked format v2, %u tokens a slab, codec %s, %d I/O workers, live state %s, pool %s",
                                             options_.chunk_tokens, codec.c_str(), options_.io_workers,
@@ -476,7 +514,7 @@ void ConversationDiskTier::remove_locked(size_t index, bool delete_files) {
     if (!e.index.empty()) remove_file(e.index);   // first, always: an entry gone from the list is not taken in again
     if (delete_files)
         for (const auto& f : e.files) remove_file(f);
-    release_refs(e);   // the chunks become ghosts (deleted after their grace, or at once under budget pressure)
+    release_refs(e);   // the chunks become the newest ghosts (deleted, oldest first, only when the limit needs the room)
     bytes_ -= e.bytes;
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
 }
@@ -488,7 +526,8 @@ size_t ConversationDiskTier::find_locked(uint64_t id) const {
 }
 
 size_t ConversationDiskTier::expire_locked() {
-    if (!open_ || options_.ttl_s <= 0) return 0;
+    // the chunked format has no time limit: the storage limit decides (v1 keeps the upstream time limit)
+    if (!open_ || options_.ttl_s <= 0 || (options_.chunked && pool_)) return 0;
     const auto now = now_();
     const auto ttl = std::chrono::seconds(options_.ttl_s);
     size_t n = 0;
@@ -502,16 +541,13 @@ size_t ConversationDiskTier::expire_locked() {
 }
 
 size_t ConversationDiskTier::expire() {
-    size_t n = 0, swept = 0;
-    uint64_t freed = 0;
+    size_t n = 0;
     {
         std::lock_guard<std::mutex> lock(m_);
         n = expire_locked();
     }
-    swept = sweep_pool(false, &freed);
     if (n) log(fmt("removed %zu conversation%s older than %lld min", n, n == 1 ? "" : "s",
                    (long long) (options_.ttl_s / 60)));
-    if (swept) log(fmt("swept %zu unreferenced chunk%s (%.0f MiB)", swept, swept == 1 ? "" : "s", mib((uint64_t) freed)));
     return n;
 }
 
@@ -525,10 +561,17 @@ bool ConversationDiskTier::put(SavedConversation&& image, bool flush) {
     job.entry.cvec = job.image.cvec;
     job.entry.bytes = job.image.bytes();
     const size_t tokens = job.entry.live.ids.size();
-    if (job.entry.bytes > options_.budget_bytes) {
-        log(fmt("dropped %zu tokens: %.0f MiB is over the disk budget", tokens, mib(job.entry.bytes)));
-        std::lock_guard<std::mutex> lock(m_);
-        ++stats_.write_failed;
+    // chunked: the raw size is not the footprint (dedup, zstd): the real bytes are known after the write, and the limit
+    // loop (make_room_locked, LimitEvent::remaining) judges those.  Only the v1 file's size is exact up front.
+    if (!(options_.chunked && pool_) && job.entry.bytes > options_.budget_bytes) {
+        log(fmt("dropped %zu tokens: %.0f MiB is over the storage limit", tokens, mib(job.entry.bytes)));
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            ++stats_.write_failed;
+            ++stats_.limit_rejected;
+            warn_limit_locked(LimitEvent::rejected, (int64_t) tokens, job.entry.bytes, job.entry.bytes);
+        }
+        flush_warnings();
         return false;
     }
     {
@@ -618,6 +661,10 @@ bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
     wo.cancel = cancel;
     e.bytes = 0;
     const bool use_chunks = options_.chunked && pool_;
+    // shared: the chunks this write hits or writes are announced in a lease until its index is published, so another
+    // engine's eviction cannot take one a manifest of ours is about to name
+    std::unique_ptr<ChunkLease> lease;
+    if (use_chunks && options_.shared) lease = pool_->begin_lease();
     ChunkedWriteStats totals;
     bool storage_failed = false;   // the disk is full (or its reserve is): the chunks this write made are ghosts to free now
     auto write_one = [&](const SavedConversation& part, const std::vector<SessionKvSource>* src, size_t k) -> bool {
@@ -635,7 +682,8 @@ bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
             co.workers = options_.io_workers;
             co.cancel = cancel;
             co.as_of_tokens = k == 0 ? as_of : 0;
-            if (options_.shared || options_.before_manifest)   // another engine's sweep may have taken a chunk this write hit: look again
+            co.lease = lease.get();
+            if (options_.shared || options_.before_manifest)   // another engine's eviction may have taken a chunk this write hit: look again
                 co.before_publish = [this](const std::vector<ChunkRef>& refs, std::string& why) {
                     if (options_.before_manifest) options_.before_manifest();
                     if (!options_.shared) return true;
@@ -701,13 +749,18 @@ bool ConversationDiskTier::write_files(Entry& e, const SavedConversation& img,
         release_refs(e);   // the chunks only this write made stay as ghosts
         e.bytes = e.manifest_bytes = 0;
         if (storage_failed && pool_ && !options_.shared) {
-            // on a nearly full disk a failed multi-GB write pins its ghosts for the whole grace, and the free-space
-            // preflight then refuses every retry: free them now (never a referenced or pinned chunk)
-            size_t freed = 0;
-            const size_t n = pool_->sweep(false, true, nullptr, &freed);
-            std::lock_guard<std::mutex> lock(m_);
-            stats_.chunks_swept += n;
-            stats_.swept_bytes += freed;
+            // the disk itself is full (not our limit): the ghosts are of no use if the free-space preflight then refuses
+            // every retry - free them all now, oldest first (never a referenced or pinned chunk)
+            uint64_t freed = 0;
+            const size_t n = pool_->evict_ghosts(UINT64_MAX, {}, &freed);
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                stats_.chunks_swept += n;
+                stats_.swept_bytes += freed;
+            }
+            log(fmt("WARNING [disk-full]: the disk is out of space (the free-space reserve is %.0f MiB): freed %zu unreferenced "
+                    "chunk%s (%.0f MiB); the storage limit is %.0f MiB, so free space elsewhere or lower --conversation-disk-mib",
+                    mib(options_.min_free_bytes), n, n == 1 ? "" : "s", mib(freed), mib(options_.budget_bytes)));
         }
         return false;
     }
@@ -784,116 +837,211 @@ std::string ConversationDiskTier::publish_locked(Entry&& e, size_t& made_room, s
         }
         ++i;
     }
-    // the budget: the oldest go (not the new one, not one being read)
+    // the limit: the oldest go (not the new one, not one being read)
     make_room_locked(id, 0, made_room);
-    stats_.evicted += made_room;
     stats_.superseded += dropped;
-    return fmt("on disk %zu, %.0f MiB; %zu removed for the budget, %zu superseded", entries_.size(),
+    return fmt("on disk %zu, %.0f MiB; %zu removed over the limit, %zu superseded", entries_.size(),
                mib(bytes_ + pool_bytes_all()), made_room, dropped);
 }
 
-// The budget loop: the files' bytes (v1) + the manifests + the chunk pool, ghosts included.  Under pressure the
-// ghosts go first, at once (never a referenced or pinned chunk), then the oldest entry; an entry that shares all its
-// chunks frees about nothing and the loop goes on - the last entry owns whatever is left.  Shared folders: a ghost
-// there may be wanted by another engine, so only the referenced bytes count and ghosts wait out their grace.
+// The limit loop.  total = the files' bytes (v1) + the manifests + the whole chunk pool, unreferenced chunks included;
+// there is no time filter.  Over the limit:
+//   A. the OLDEST unreferenced chunks go (ChunkPool::evict_ghosts: least recently released / hit / read first), only as
+//      many as are needed - the rest stay as a dedup cache;
+//   B. still over: the OLDEST entry goes (a WARNING [disk-limit]: it was still valid, the limit is too small); its
+//      chunks no other entry names become ghosts, and A takes them, oldest first, on the next turn.
+// An entry that shares all its chunks frees about nothing and the loop goes on; the last entry (the protected one)
+// owns whatever is left and is kept, with a WARNING.  Shared folders: other engines' references are invisible, so
+// A consults their manifests and leases (ChunkPool::evict_ghosts) and a census adds their chunks to the total.
 void ConversationDiskTier::make_room_locked(uint64_t protect_a, uint64_t protect_b, size_t& evicted) {
     evicted = 0;
-    auto total = [&]() { return bytes_ + (pool_ ? pool_->live_bytes() : 0); };
+    const uint64_t limit = options_.budget_bytes;
+    auto total = [&]() { return bytes_ + (pool_ ? pool_->bytes() : 0); };
+    const bool shared = options_.shared && pool_;
+    if (shared) {
+        pool_->census();
+        sort_by_use_locked();
+    }
+    const uint64_t demand = total();   // before any eviction
     for (;;) {
-        if (pool_ && !options_.shared && bytes_ + pool_->bytes() > options_.budget_bytes) {
-            size_t freed = 0;
-            const size_t n = pool_->sweep(false, true, nullptr, &freed);
+        if (shared && evicted) pool_->census();
+        if (total() <= limit) break;
+        if (pool_) {
+            uint64_t freed = 0;
+            bool undecided = false;
+            std::function<bool(std::set<ChunkKey>&)> named;
+            if (shared) named = [this](std::set<ChunkKey>& out) { return named_chunks_locked(out); };
+            const size_t n = pool_->evict_ghosts(total() - limit, named, &freed, &undecided);
             stats_.chunks_swept += n;
             stats_.swept_bytes += freed;
+            if (total() <= limit) break;
+            if (undecided) {
+                // the manifests of the other engines cannot be read just now: nothing may be deleted for that reason, and
+                // evicting entries would only turn more chunks into ghosts that cannot go either - stop, say so
+                warn_limit_locked(LimitEvent::undecided, 0, total(), std::max(demand, total()));
+                break;
+            }
         }
-        if (total() <= options_.budget_bytes) break;
         size_t victim = 0;
         while (victim < entries_.size() && (entries_[victim].id == protect_a || entries_[victim].id == protect_b ||
                                             entries_[victim].id == reading_)) ++victim;
-        if (victim == entries_.size()) break;
+        if (victim == entries_.size()) {
+            // what is left is protected (the entry just written, the one being read) or other engines' ghosts
+            warn_limit_locked(LimitEvent::remaining, 0, total(), demand);
+            break;
+        }
+        const Entry& v = entries_[victim];
+        const uint64_t held = footprint(v);
+        warn_limit_locked(LimitEvent::evicted, (int64_t) v.live.ids.size(), held, std::max(demand, total()));
+        ++stats_.forced_evictions;
+        ++stats_.evicted;
+        stats_.forced_evicted_bytes += held;
         remove_locked(victim, true);
         ++evicted;
     }
 }
 
-size_t ConversationDiskTier::sweep_locked(bool force) {
-    if (!pool_ || options_.shared) return 0;
+uint64_t ConversationDiskTier::footprint(const Entry& e) const {
+    uint64_t n = e.bytes;
+    if (e.chunked)
+        for (const auto& r : unique_refs(e.refs)) n += chunk_file_size(r.stored_len);
+    return n;
+}
+
+void ConversationDiskTier::touch_index(const Entry& e) const {
+#ifndef _WIN32
+    if (e.index.empty()) return;
+    struct timespec ts[2];
+    ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_OMIT;
+    ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_NOW;
+    ::utimensat(AT_FDCWD, e.index.c_str(), ts, 0);
+#else
+    (void) e;
+#endif
+}
+
+// shared: an entry another engine used (a keep-take touches its index) or published is newer than this list says
+void ConversationDiskTier::sort_by_use_locked() {
+    if (!options_.shared || entries_.size() < 2) return;
+    std::map<uint64_t, int64_t> ns;
+    for (const auto& e : entries_) ns[e.id] = e.index.empty() ? INT64_MAX : file_mtime_ns(e.index);
+    std::stable_sort(entries_.begin(), entries_.end(), [&](const Entry& a, const Entry& b) { return ns[a.id] < ns[b.id]; });
+}
+
+// One line a minute at most (now_(), the tier's own steady clock): the first is immediate, the events in between are
+// counted and named in the next line.  The counters (stats_) always count; this only limits the log.
+void ConversationDiskTier::warn_limit_locked(LimitEvent what, int64_t tokens, uint64_t entry_bytes, uint64_t demand_bytes) {
     const auto now = now_();
-    if (!force && swept_ && now - last_sweep_ < std::chrono::seconds(60)) return 0;
-    swept_ = true;
-    last_sweep_ = now;
-    size_t freed = 0;
-    const size_t n = pool_->sweep(false, false, nullptr, &freed);
-    stats_.chunks_swept += n;
-    stats_.swept_bytes += freed;
-    return n;
+    if (limit_warned_ && now - limit_warn_at_ < std::chrono::seconds(60)) {
+        ++limit_warn_pending_;
+        return;
+    }
+    const size_t more = limit_warn_pending_;
+    limit_warn_pending_ = 0;
+    limit_warned_ = true;
+    limit_warn_at_ = now;
+    ++stats_.limit_warnings;
+    const unsigned long long suggest = (unsigned long long) std::ceil(mib(demand_bytes) * 1.25);
+    const std::string since = more ? fmt(" (%zu more since the last warning)", more) : std::string();
+    std::string line;
+    switch (what) {
+    case LimitEvent::evicted:
+        line = fmt("WARNING [disk-limit]: the conversation disk limit is too small: evicted a parked conversation that was "
+                   "still referenced (%lld tokens, %.0f MiB) to stay within %.0f MiB; %.0f MiB were in use or needed%s. "
+                   "Raise --conversation-disk-mib (e.g. to %llu).",
+                   (long long) tokens, mib(entry_bytes), mib(options_.budget_bytes), mib(demand_bytes), since.c_str(), suggest);
+        break;
+    case LimitEvent::rejected:
+        line = fmt("WARNING [disk-limit]: the conversation disk limit is too small: rejected a conversation of %lld tokens "
+                   "(%.0f MiB) that does not fit the %.0f MiB limit alone%s. Raise --conversation-disk-mib (e.g. to %llu).",
+                   (long long) tokens, mib(entry_bytes), mib(options_.budget_bytes), since.c_str(), suggest);
+        break;
+    case LimitEvent::undecided:
+        line = fmt("WARNING [disk-limit]: the conversation disk is %.0f MiB over its %.0f MiB limit, but a manifest of another "
+                   "engine in the shared folder could not be read, so no chunk may be deleted and nothing was evicted%s. It is "
+                   "retried at the next write (a manifest that stays unreadable is given up on after 3 tries).",
+                   mib(entry_bytes > options_.budget_bytes ? entry_bytes - options_.budget_bytes : 0), mib(options_.budget_bytes),
+                   since.c_str());
+        break;
+    case LimitEvent::remaining:
+        line = fmt("WARNING [disk-limit]: the conversation disk limit is too small: the conversation just written or being "
+                   "read (%.0f MiB in use) alone exceeds the %.0f MiB limit%s. Raise --conversation-disk-mib (e.g. to %llu).",
+                   mib(entry_bytes), mib(options_.budget_bytes), since.c_str(), suggest);
+        break;
+    }
+    warn_lines_.push_back(std::move(line));
 }
 
-size_t ConversationDiskTier::sweep_pool(bool force, uint64_t* freed_out) {
-    if (freed_out) *freed_out = 0;
-    if (!pool_) return 0;
-    std::vector<std::pair<std::string, std::vector<ChunkKey>>> held;
+void ConversationDiskTier::flush_warnings() {
+    std::vector<std::string> lines;
     {
         std::lock_guard<std::mutex> lock(m_);
-        const auto now = now_();
-        if (!force && swept_ && now - last_sweep_ < std::chrono::seconds(60)) return 0;
-        swept_ = true;
-        last_sweep_ = now;
-        if (options_.shared)
-            for (const auto& e : entries_)
-                if (!e.index.empty()) {
-                    held.emplace_back(e.index, std::vector<ChunkKey>());
-                    for (const auto& r : e.refs) held.back().second.push_back(r.key);
-                }
+        lines.swap(warn_lines_);
     }
-    // Outside m_.  A chunk an entry published after the snapshot names is referenced in the pool already (the sweep
-    // never takes a referenced chunk), and one an entry dropped meanwhile is only kept a little longer.
-    size_t freed = 0, n = 0;
-    if (options_.shared) {
-        const std::set<ChunkKey> foreign = foreign_refs(held);
-        n = pool_->sweep(true, false, &foreign, &freed);
-    } else {
-        n = pool_->sweep(false, false, nullptr, &freed);
-    }
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        stats_.chunks_swept += n;
-        stats_.swept_bytes += freed;
-    }
-    if (freed_out) *freed_out = freed;
-    return n;
+    for (const auto& l : lines) log(l);
 }
 
-// Shared: every chunk any manifest of this identity in the folder names - listed afresh, the entries this engine
-// holds from their references, the others' parsed from their manifests.
-std::set<ChunkKey> ConversationDiskTier::foreign_refs(
-        const std::vector<std::pair<std::string, std::vector<ChunkKey>>>& held) const {
-    std::set<ChunkKey> keys;
+// Shared: every chunk any manifest of this identity in the folder names - the entries this engine holds from their
+// references, the others' parsed from their manifests (cached per index file: an index never changes after it is
+// published).  False when it cannot be told (a manifest of an index that still exists does not parse): the caller then
+// deletes nothing.  A manifest that is gone with its index (another engine removed the entry meanwhile) is skipped.
+bool ConversationDiskTier::named_chunks_locked(std::set<ChunkKey>& out) {
+    std::set<std::string> held;
+    for (const auto& e : entries_) {
+        if (!e.index.empty()) held.insert(e.index);
+        for (const auto& r : e.refs) out.insert(r.key);
+    }
     std::error_code ec;
     const SessionFileIdentity fid = file_identity();
+    std::set<std::string> present;
+    bool ok = true;
     for (fs::directory_iterator it(upath(options_.dir), ec), end; !ec && it != end; it.increment(ec)) {
         const std::string name = ustr(it->path().filename());
         if (it->path().extension() != ".idx" || name.rfind(file_prefix(), 0) != 0) continue;
         const std::string path = ustr(it->path());
-        bool known = false;
-        for (const auto& h : held)
-            if (h.first == path) {
-                keys.insert(h.second.begin(), h.second.end());
-                known = true;
-                break;
+        present.insert(path);
+        if (held.count(path)) continue;
+        auto cached = named_cache_.find(path);
+        if (cached == named_cache_.end()) {
+            std::vector<ChunkKey> keys;
+            Entry t;
+            bool transient = false;
+            // (a definite failed read: another identity's, its own pool, or torn: names nothing here)
+            if (read_index(path, t, &transient)) {
+                for (const auto& f : t.files) {
+                    std::vector<ChunkRef> r;
+                    uint64_t mb = 0;
+                    std::string why;
+                    bool tr = false;
+                    if (!is_chunked_manifest(f)) continue;
+                    if (chunked_manifest_refs(f, fid, r, mb, why, &tr)) {
+                        for (const auto& x : r) keys.push_back(x.key);
+                    } else {
+                        std::error_code xec;
+                        if (!fs::exists(upath(path), xec)) { keys.clear(); break; }   // the entry was removed while it was read
+                        if (tr) { transient = true; break; }   // an I/O or resource error: cannot tell, and never cached
+                        // a manifest that was read and is invalid under a live index (nobody can use that entry) must not
+                        // block every eviction for good: after 3 passes in a row it is taken as naming nothing - the keys
+                        // of the entry's other files stay named
+                        if (++named_fail_[path] < 3) { ok = false; break; }
+                    }
+                }
             }
-        if (known) continue;
-        Entry t;
-        if (!read_index(path, t)) continue;   // another identity's (its own pool) or torn
-        for (const auto& f : t.files) {
-            std::vector<ChunkRef> r;
-            uint64_t mb = 0;
-            std::string why;
-            if (is_chunked_manifest(f) && chunked_manifest_refs(f, fid, r, mb, why))
-                for (const auto& x : r) keys.insert(x.key);
+            if (transient) ok = false;   // cannot tell now: no chunk is deleted this time, nothing is cached
+            if (!ok) continue;
+            named_fail_.erase(path);
+            cached = named_cache_.emplace(path, std::move(keys)).first;
         }
+        out.insert(cached->second.begin(), cached->second.end());
     }
-    return keys;
+    if (ec) return false;
+    for (auto it = named_cache_.begin(); it != named_cache_.end();)
+        if (present.count(it->first)) ++it;
+        else it = named_cache_.erase(it);
+    for (auto it = named_fail_.begin(); it != named_fail_.end();)
+        if (present.count(it->first)) ++it;
+        else it = named_fail_.erase(it);
+    return ok;
 }
 
 void ConversationDiskTier::write(Job& job) {
@@ -904,7 +1052,6 @@ void ConversationDiskTier::write(Job& job) {
         std::lock_guard<std::mutex> lock(m_);
         expired = expire_locked();
     }
-    sweep_pool(false);
     const auto t0 = std::chrono::steady_clock::now();
     Entry e = std::move(job.entry);
     std::string error;
@@ -934,6 +1081,7 @@ void ConversationDiskTier::write(Job& job) {
         size_t made_room = 0, dropped = 0;
         tail = publish_locked(std::move(e), made_room, dropped);
     }
+    flush_warnings();
     log(fmt("wrote %zu tokens: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); %s; %zu expired%s", tokens, mib(b), nfiles,
             nfiles == 1 ? "" : "s", ms, mbps(b, ms), tail.c_str(), expired, note.c_str()));
 }
@@ -961,17 +1109,31 @@ bool ConversationDiskTier::write_now(const SavedConversation& image, const std::
     const uint64_t estimate = image.bytes() + sources_bytes(sources);
     const size_t tokens = image.live.ids.size();
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::unique_lock<std::mutex> lock(m_);
         // already there with exactly these keys: nothing to write
         for (const auto& x : entries_)
             if (x.cvec == e.cvec && same_key(x.live, e.live) && x.checkpoints.size() == e.checkpoints.size() &&
                 std::equal(x.checkpoints.begin(), x.checkpoints.end(), e.checkpoints.begin(), same_key)) {
                 id = x.id;
+                // a write hit is a use: the entry is the newest in the LRU order (and in its index file's mtime)
+                const size_t at = find_locked(x.id);
+                if (at != entries_.size()) {
+                    Entry moved = std::move(entries_[at]);
+                    entries_.erase(entries_.begin() + (std::ptrdiff_t) at);
+                    moved.at = now_();
+                    touch_index(moved);
+                    entries_.push_back(std::move(moved));
+                }
                 return true;
             }
-        if (estimate > options_.budget_bytes) {
+        if (!(options_.chunked && pool_) && estimate > options_.budget_bytes) {   // chunked: judged on the real bytes after the write
             ++stats_.write_failed;
-            error = fmt("%.0f MiB is over the disk budget", mib(estimate));
+            ++stats_.limit_rejected;
+            error = fmt("%.0f MiB is over the storage limit (%.0f MiB; raise --conversation-disk-mib)", mib(estimate),
+                        mib(options_.budget_bytes));
+            warn_limit_locked(LimitEvent::rejected, (int64_t) tokens, estimate, estimate);
+            lock.unlock();
+            flush_warnings();
             return false;
         }
         e.id = ++next_id_;
@@ -1007,6 +1169,7 @@ bool ConversationDiskTier::write_now(const SavedConversation& image, const std::
         size_t made_room = 0, dropped = 0;
         tail = publish_locked(std::move(e), made_room, dropped);
     }
+    flush_warnings();
     log(fmt("saved %zu tokens while idle: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); %s%s", tokens, mib(b), nfiles,
             nfiles == 1 ? "" : "s", ms, mbps(b, ms), tail.c_str(), note.c_str()));
     return true;
@@ -1046,10 +1209,13 @@ size_t ConversationDiskTier::rescan() {
         if (!read_index(path, e) || !bind_chunks(e)) continue;   // another identity, torn, or a chunk is missing
         e.id = ++next_id_;
         e.at = now_();
+        e.idx_ns = file_mtime_ns(path);
         bytes_ += e.bytes;
         entries_.push_back(std::move(e));
         ++in;
     }
+    if (in) sort_by_use_locked();   // (an index another engine wrote earlier than the last one looked at is not the newest)
+    if (pool_) pool_->census();
     if (in || gone)
         log(fmt("shared folder: %zu conversation%s from other engines, %zu removed by them; on disk %zu (%.0f MiB)", in,
                 in == 1 ? "" : "s", gone, entries_.size(), mib(bytes_ + pool_bytes_all())));
@@ -1126,18 +1292,24 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         for (const auto& c : want.checkpoints)
             if ((int64_t) c.ids.size() == upto) cut = upto;
     // the chunks stay pinned while they are read: the entry leaves the list now and drops its references, but a pinned
-    // chunk is never swept; after the read the pins go and the chunks wait out their grace (a continuation of this
-    // conversation is written next and hits them)
+    // chunk is never swept; after the read the pins go and the chunks stay as ghosts until the limit needs the room (a
+    // continuation of this conversation is written next and hits them)
     std::vector<ChunkRef> pins;
+    std::unique_ptr<ChunkLease> lease;   // shared: the entry's chunks are announced before its index goes (see below)
     if (want.chunked && pool_ && !keep) {
         pins = want.refs;
         pool_->ref(pins.data(), pins.size());
+        if (options_.shared) {
+            lease = pool_->begin_lease();
+            if (lease) lease->announce(pins.data(), pins.size());
+        }
     }
     if (keep) {
-        // stays, as the newest: the budget takes the least recently used first
+        // stays, as the newest: the limit takes the least recently used first (also after a restart: the index's mtime)
         Entry moved = std::move(entries_[index]);
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         moved.at = now_();
+        touch_index(moved);
         entries_.push_back(std::move(moved));
         reading_ = id;
     } else {
@@ -1181,6 +1353,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     lock.lock();
     reading_ = 0;
     if (!pins.empty()) pool_->unref(pins.data(), pins.size());
+    lease.reset();   // (the pins are the ghosts' protection from here on, and the files are gone)
     if (!keep) {
         for (const auto& f : files) remove_file(f);
     } else if (!ok) {
@@ -1269,22 +1442,24 @@ std::string ConversationDiskTier::summary() const {
     std::lock_guard<std::mutex> lock(m_);
     const auto& s = stats_;
     const std::string chunks = !pool_ ? std::string() :
-        fmt("; chunks: %llu new, %llu hit, %.0f MiB written, %.0f MiB deduplicated of %.0f MiB, %llu swept (%.0f MiB), "
-            "pool %zu (%.0f MiB), %s I/O",
+        fmt("; chunks: %llu new, %llu hit, %.0f MiB written, %.0f MiB deduplicated of %.0f MiB, %llu evicted for the limit (%.0f MiB), "
+            "pool %zu (%.0f MiB, %zu unreferenced = %.0f MiB), %s I/O",
             (unsigned long long) s.chunks_new, (unsigned long long) s.chunks_hit, mib(s.new_file_bytes),
             mib(s.dedup_bytes), mib(s.raw_bytes), (unsigned long long) s.chunks_swept, mib(s.swept_bytes), pool_->count(),
-            mib(pool_->bytes()), s.direct_io ? "direct" : "buffered") +
+            mib(pool_->bytes()), pool_->ghost_count(), mib(pool_->ghost_bytes()), s.direct_io ? "direct" : "buffered") +
         fmt("; %llu prefix reads (%.0f MiB), %llu writes as of a checkpoint (%llu tokens left out)",
             (unsigned long long) s.prefix_reads, mib(s.prefix_raw_bytes), (unsigned long long) s.live_skipped,
             (unsigned long long) s.live_skipped_tokens);
     return fmt("totals: %zu queued, %zu written + %zu saved while idle (%.0f MiB, %.0f MB/s; %zu given way to a "
                "request), %zu RAM hits, %zu disk hits (%zu kept; %.0f MiB, %.0f MB/s), %llu prompt tokens given back, "
-               "%zu waits for RAM (%.0f ms), %zu expired, %zu removed for the budget, %zu superseded, %zu/%zu "
-               "writes/reads failed; on disk %zu (%.0f MiB), queue %zu%s",
+               "%zu waits for RAM (%.0f ms), %zu expired, %zu removed over the limit (%zu forced%s, %llu rejected), %zu superseded, "
+               "%zu/%zu writes/reads failed; on disk %zu (%.0f MiB of the %.0f MiB limit), queue %zu%s",
                s.queued, s.written, s.synced, mib(s.bytes_written), mbps(s.bytes_written, s.write_ms),
                s.sync_cancelled, s.ram_hits, s.disk_hits, s.kept, mib(s.bytes_read), mbps(s.bytes_read, s.read_ms),
-               (unsigned long long) s.tokens_back, s.waits, s.wait_ms, s.expired, s.evicted, s.superseded,
-               s.write_failed, s.read_failed, entries_.size(), mib(bytes_ + pool_bytes_all()),
+               (unsigned long long) s.tokens_back, s.waits, s.wait_ms, s.expired, s.evicted,
+               (size_t) s.forced_evictions, s.forced_evictions ? ": raise --conversation-disk-mib" : "",
+               (unsigned long long) s.limit_rejected, s.superseded,
+               s.write_failed, s.read_failed, entries_.size(), mib(bytes_ + pool_bytes_all()), mib(options_.budget_bytes),
                queue_.size() + (writing_ ? 1 : 0), chunks.c_str());
 }
 

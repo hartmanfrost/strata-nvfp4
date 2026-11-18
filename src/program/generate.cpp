@@ -1133,9 +1133,11 @@ struct Options {
     /// --serve: the disk tier of the parked conversations (conversation_disk.hpp): a conversation the RAM cache evicts
     /// is written to this folder instead of dropped, and read back when a request continues it.  Empty = off.
     std::string conversation_disk_dir;
-    int64_t conversation_disk_mib = 32768;    ///< --conversation-disk-mib: at most this many MiB of files
-    int64_t conversation_disk_ttl_min = 30;   ///< --conversation-disk-ttl-min: a file older than this is removed
-    bool conversation_disk_persist = false;   ///< --conversation-disk-persist: the files outlive the engine (budget only)
+    /// --conversation-disk-mib: THE storage limit of the disk tier (files, manifests, the whole chunk pool); over it the
+    /// oldest data goes first and a WARNING says to raise it (conversation_disk.hpp)
+    int64_t conversation_disk_mib = strata::core::kConversationDiskDefaultMib;
+    int64_t conversation_disk_ttl_min = 30;   ///< --conversation-disk-ttl-min: a one-file (v1) conversation older than this is removed
+    bool conversation_disk_persist = false;   ///< --conversation-disk-persist: the files outlive the engine (storage limit only)
     /// --conversation-disk-sync-s N (strata-nvfp4): with --conversation-disk-persist, after N seconds without a request
     /// the engine writes the live conversation and every parked one not on the disk yet (given up within one 16 MiB
     /// block when a request arrives), so a kill (the tray's taskkill /F /T) loses at most what came after the last
@@ -1350,10 +1352,13 @@ void usage() {
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
                  "  --conversation-disk-dir DIR  --serve: a conversation the RAM cache evicts is written to DIR and read\n"
                  "                       back when a request continues it (needs --conversation-cache-mib; default off)\n"
-                 "  --conversation-disk-mib N  --serve: at most N MiB of such files (default 32768)\n"
-                 "  --conversation-disk-ttl-min N  --serve: a conversation stays on the disk N minutes (default 30; 0 =\n"
-                 "                       until the budget evicts it)\n"
-                 "  --conversation-disk-persist  --serve: keep the disk's conversations for the next start (budget only,\n"
+                 "  --conversation-disk-mib N  --serve: THE storage limit of the disk tier, in MiB (default 10240 = 10 GB):\n"
+                 "                       files, manifests and the whole chunk pool.  Over it the OLDEST data goes first\n"
+                 "                       (unreferenced chunks, then the oldest conversations); removing a conversation that\n"
+                 "                       is still valid logs a 'WARNING [disk-limit]' = raise this\n"
+                 "  --conversation-disk-ttl-min N  --serve: a one-file conversation stays on the disk N minutes (default 30;\n"
+                 "                       0 = until the limit evicts it); ignored with --conversation-disk-chunked\n"
+                 "  --conversation-disk-persist  --serve: keep the disk's conversations for the next start (storage limit only,\n"
                  "                       no time limit); QUIT writes the current and the parked ones there first\n"
                  "  --conversation-disk-sync-s N  --serve, with --conversation-disk-persist: after N s without a request\n"
                  "                       the live conversation and every parked one not on the disk yet are written there\n"
@@ -1364,8 +1369,9 @@ void usage() {
                  "                       the others wrote, so a parked conversation resumes on any replica (implies\n"
                  "                       --conversation-disk-persist)\n"
                  "  --conversation-disk-chunked  --serve: write the disk tier's conversations as a small manifest plus\n"
-                 "                       deduplicated chunks (a continued conversation writes only what changed; an\n"
-                 "                       unreferenced chunk is deleted after 10 min; default off = one file each)\n"
+                 "                       deduplicated chunks (a continued conversation writes only what changed; there is\n"
+                 "                       no time limit: an unreferenced chunk stays as a cache until the storage limit\n"
+                 "                       needs the room, oldest first; default off = one file each)\n"
                  "  --conversation-disk-chunk-tokens N  --serve, with --conversation-disk-chunked: tokens of K/V per\n"
                  "                       chunk (a multiple of 4, 64..4096; default 512)\n"
                  "  --conversation-disk-codec raw|zstd[:LEVEL]  --serve, with --conversation-disk-chunked: how chunks\n"
@@ -14184,7 +14190,11 @@ int main(int argc, char** argv) {
         strata::core::ConversationDiskOptions disk_opts;
         disk_opts.dir = conversations.enabled() ? o.conversation_disk_dir : std::string();
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
-        disk_opts.ttl_s = o.conversation_disk_ttl_min * 60;
+        // the chunked format has no time limit (the storage limit decides): the flag only applies to one-file conversations
+        disk_opts.ttl_s = o.conversation_disk_chunked ? 0 : o.conversation_disk_ttl_min * 60;
+        if (o.conversation_disk_chunked && o.conversation_disk_ttl_min != 30)
+            std::fprintf(stderr, "strata serve: --conversation-disk-ttl-min is ignored with --conversation-disk-chunked "
+                                 "(no time limit: the oldest data goes when --conversation-disk-mib is exceeded)\n");
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
         disk_opts.chunked = o.conversation_disk_chunked;
         disk_opts.chunk_tokens = (uint32_t) o.conversation_disk_chunk_tokens;
@@ -14198,7 +14208,7 @@ int main(int argc, char** argv) {
             disk_opts.persist = session_identity(disk_opts.identity, id_err, {});
             disk_opts.shared = disk_opts.persist && o.conversation_disk_shared;
             if (disk_opts.persist) {
-                disk_opts.ttl_s = 0;   // the budget alone
+                disk_opts.ttl_s = 0;   // the storage limit alone
                 std::signal(SIGINT, SIG_IGN);   // Ctrl+C reaches the engine too: the server's QUIT ends it, after the save
             } else {
                 std::fprintf(stderr, "strata serve: conversation disk: not persistent (%s)\n", id_err.c_str());
