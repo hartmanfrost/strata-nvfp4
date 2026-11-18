@@ -1,6 +1,7 @@
 // src/core/conversation_disk.cpp - the disk tier of the parked conversations.  See the header.
 // (xrip, upstream PR #1937 + b0c4d361 / 65f3fd00; the strata-nvfp4 additions are marked in the header.)
 #include "strata/core/conversation_disk.hpp"
+#include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -438,6 +439,9 @@ bool ConversationDiskTier::put(SavedConversation&& image, bool flush) {
 }
 
 void ConversationDiskTier::writer() {
+    // off the host thread's core: the tier is opened by the host thread, already pinned to its one CPU, which this
+    // thread inherits (strata/platform/aux_cpus.hpp; a no-op before the host is placed or off Linux)
+    strata::aux_cpus::spread_current_thread();
 #if defined(__linux__)
     // below the serving threads: the write is background work, decode and prompt reading come first
     setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), 10);
